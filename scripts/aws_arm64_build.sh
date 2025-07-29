@@ -38,13 +38,13 @@ readonly MAX_CLIENTS="${MAX_CLIENTS:-1000}"
 readonly IP_LIMIT_V3="${IP_LIMIT_V3:-8}"
 readonly IP_LIMIT_V2="${IP_LIMIT_V2:-4}"
 
-# Logging functions
+# Logging functions - ALWAYS output to stderr
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo -e "${BLUE}[INFO]${NC} $1" >&2
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
 }
 
 log_error() {
@@ -52,7 +52,7 @@ log_error() {
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    echo -e "${YELLOW}[WARN]${NC} $1" >&2
 }
 
 # Check if running as root
@@ -140,8 +140,8 @@ install_rust() {
     echo 'source $HOME/.cargo/env' >> ~/.bashrc
 
     # Verify installation
-    rustc --version
-    cargo --version
+    rustc --version >&2
+    cargo --version >&2
 
     # Add ARM64 target (should be default on ARM64, but ensure it's there)
     rustup target add $CARGO_TARGET
@@ -373,9 +373,9 @@ build_project() {
 
     # Strip debug symbols (check if strip tool exists)
     if command -v aarch64-linux-gnu-strip &> /dev/null; then
-        aarch64-linux-gnu-strip target/$CARGO_TARGET/release/$PROJECT_NAME
+        aarch64-linux-gnu-strip target/$CARGO_TARGET/release/$PROJECT_NAME >&2
     elif command -v strip &> /dev/null; then
-        strip target/$CARGO_TARGET/release/$PROJECT_NAME
+        strip target/$CARGO_TARGET/release/$PROJECT_NAME >&2
     fi
 
     # Verify binary
@@ -688,29 +688,29 @@ start_services() {
 display_info() {
     local maint_pw=$(grep MAINT_PASSWORD $CONFIG_DIR/server.conf | cut -d'"' -f2)
 
-    echo
-    echo "========================================="
-    echo "   CnCNet Server Installation Complete"
-    echo "========================================="
-    echo
-    echo "Server Status: $(systemctl is-active $SYSTEMD_SERVICE)"
-    echo "Configuration: $CONFIG_DIR/server.conf"
-    echo "Logs: $LOG_DIR/"
-    echo
-    echo "Network Ports:"
-    echo "  - Tunnel V3: UDP $V3_PORT"
-    echo "  - Tunnel V2: UDP/TCP $V2_PORT"
-    echo "  - P2P NAT:   UDP $P2P_PORT1, $P2P_PORT2"
-    echo
-    echo "Maintenance Password: $maint_pw"
-    echo
-    echo "Useful Commands:"
-    echo "  - View logs:     journalctl -u $SYSTEMD_SERVICE -f"
-    echo "  - Check status:  systemctl status $SYSTEMD_SERVICE"
-    echo "  - Restart:       systemctl restart $SYSTEMD_SERVICE"
-    echo "  - Health check:  $INSTALL_DIR/health_check.sh"
-    echo
-    echo "========================================="
+    echo >&2
+    echo "=========================================" >&2
+    echo "   CnCNet Server Installation Complete" >&2
+    echo "=========================================" >&2
+    echo >&2
+    echo "Server Status: $(systemctl is-active $SYSTEMD_SERVICE)" >&2
+    echo "Configuration: $CONFIG_DIR/server.conf" >&2
+    echo "Logs: $LOG_DIR/" >&2
+    echo >&2
+    echo "Network Ports:" >&2
+    echo "  - Tunnel V3: UDP $V3_PORT" >&2
+    echo "  - Tunnel V2: UDP/TCP $V2_PORT" >&2
+    echo "  - P2P NAT:   UDP $P2P_PORT1, $P2P_PORT2" >&2
+    echo >&2
+    echo "Maintenance Password: $maint_pw" >&2
+    echo >&2
+    echo "Useful Commands:" >&2
+    echo "  - View logs:     journalctl -u $SYSTEMD_SERVICE -f" >&2
+    echo "  - Check status:  systemctl status $SYSTEMD_SERVICE" >&2
+    echo "  - Restart:       systemctl restart $SYSTEMD_SERVICE" >&2
+    echo "  - Health check:  $INSTALL_DIR/health_check.sh" >&2
+    echo >&2
+    echo "=========================================" >&2
 }
 
 # Main installation flow
