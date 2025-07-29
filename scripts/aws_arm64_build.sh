@@ -355,11 +355,11 @@ build_project() {
     log_info "Cloning and building the project..."
 
     # Create temporary build directory
-    BUILD_DIR=$(mktemp -d)
+    local BUILD_DIR=$(mktemp -d)
     cd $BUILD_DIR
 
     # Clone repository
-    git clone $REPO_URL
+    git clone $REPO_URL >&2
     cd $PROJECT_NAME
 
     # Build with optimizations for ARM64
@@ -369,7 +369,7 @@ build_project() {
     export RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat -C codegen-units=1"
 
     # Build release binary
-    cargo build --release --target $CARGO_TARGET
+    cargo build --release --target $CARGO_TARGET >&2
 
     # Strip debug symbols (check if strip tool exists)
     if command -v aarch64-linux-gnu-strip &> /dev/null; then
@@ -379,11 +379,11 @@ build_project() {
     fi
 
     # Verify binary
-    file target/$CARGO_TARGET/release/$PROJECT_NAME
+    file target/$CARGO_TARGET/release/$PROJECT_NAME >&2
 
     log_success "Project built successfully"
 
-    # Return build directory
+    # Return build directory - ONLY output the path, nothing else
     echo $BUILD_DIR
 }
 
