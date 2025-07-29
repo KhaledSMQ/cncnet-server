@@ -723,9 +723,9 @@ main() {
 
     # System preparation
     update_system
-    load_kernel_modules
+#    load_kernel_modules
     install_rust
-    configure_system_limits
+#    configure_system_limits
 #    configure_firewall
 
     # User and directories
@@ -737,10 +737,10 @@ main() {
 
     # Service configuration
     create_systemd_service
-    configure_logging
-    configure_monitoring
-    configure_fail2ban
-    tune_arm64_performance
+#    configure_logging
+#    configure_monitoring
+#    configure_fail2ban
+#    tune_arm64_performance
 
     # Start services
     start_services
