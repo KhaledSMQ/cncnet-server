@@ -87,7 +87,6 @@ update_system() {
             apt-get install -y \
                 build-essential \
                 git \
-                curl \
                 wget \
                 pkg-config \
                 libssl-dev \
@@ -105,7 +104,6 @@ update_system() {
             yum groupinstall -y "Development Tools"
             yum install -y \
                 git \
-                curl \
                 wget \
                 openssl-devel \
                 htop \
