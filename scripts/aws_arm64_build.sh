@@ -97,7 +97,8 @@ update_system() {
                 fail2ban \
                 rsyslog \
                 logrotate \
-                chrony
+                chrony \
+                conntrack
             ;;
         amzn|centos|rhel|fedora)
             yum update -y
@@ -113,7 +114,8 @@ update_system() {
                 fail2ban \
                 rsyslog \
                 logrotate \
-                chrony
+                chrony \
+                conntrack-tools
             ;;
         *)
             log_error "Unsupported distribution: $OS"
@@ -145,6 +147,38 @@ install_rust() {
     rustup target add $CARGO_TARGET
 
     log_success "Rust installed successfully"
+}
+
+# Load necessary kernel modules
+load_kernel_modules() {
+    log_info "Loading kernel modules for connection tracking..."
+
+    # Load netfilter modules
+    local modules=(
+        "nf_conntrack"
+        "nf_conntrack_ipv4"
+        "nf_conntrack_ipv6"
+        "nf_conntrack_netlink"
+        "xt_conntrack"
+    )
+
+    for module in "${modules[@]}"; do
+        if modprobe $module 2>/dev/null; then
+            log_info "Loaded module: $module"
+        else
+            log_warn "Could not load module: $module (may not exist on this kernel)"
+        fi
+    done
+
+    # Make modules persistent
+    if [[ -d /etc/modules-load.d ]]; then
+        echo "# Netfilter connection tracking modules" > /etc/modules-load.d/netfilter.conf
+        for module in "${modules[@]}"; do
+            echo "$module" >> /etc/modules-load.d/netfilter.conf
+        done
+    fi
+
+    log_success "Kernel modules configured"
 }
 
 # Configure system limits for high performance
@@ -188,17 +222,6 @@ net.ipv4.udp_wmem_min = 8192
 # Enable TCP Fast Open
 net.ipv4.tcp_fastopen = 3
 
-# Increase connection tracking for NAT
-net.netfilter.nf_conntrack_max = 1048576
-net.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_udp_timeout = 30
-net.netfilter.nf_conntrack_udp_timeout_stream = 60
-
-# Optimize for low latency
-net.ipv4.tcp_low_latency = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_timestamps = 1
-
 # Security hardening
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_rfc1337 = 1
@@ -212,10 +235,29 @@ net.ipv4.tcp_max_syn_backlog = 65535
 # Enable BBR congestion control if available
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+
+# Optimize for low latency
+net.ipv4.tcp_low_latency = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
 EOF
 
-    # Apply sysctl settings
-    sysctl -p
+    # Add connection tracking settings only if the module is loaded
+    if lsmod | grep -q nf_conntrack; then
+        cat >> /etc/sysctl.conf << EOF
+
+# Connection tracking for NAT (if available)
+net.netfilter.nf_conntrack_max = 1048576
+net.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_udp_timeout = 30
+net.netfilter.nf_conntrack_udp_timeout_stream = 60
+EOF
+    else
+        log_warn "Connection tracking modules not available - skipping conntrack settings"
+    fi
+
+    # Apply sysctl settings, ignoring errors for missing parameters
+    sysctl -p 2>&1 | grep -v "No such file or directory" || true
 
     log_success "System limits configured"
 }
@@ -251,11 +293,13 @@ configure_firewall() {
 
         amzn|centos|rhel|fedora)
             # Configure iptables
-            systemctl enable iptables
-            systemctl start iptables
+            systemctl enable iptables 2>/dev/null || true
+            systemctl start iptables 2>/dev/null || true
 
             # Save current rules
-            iptables-save > /etc/sysconfig/iptables.backup
+            if command -v iptables-save &> /dev/null; then
+                iptables-save > /etc/sysconfig/iptables.backup 2>/dev/null || true
+            fi
 
             # Clear existing rules
             iptables -F
@@ -283,7 +327,11 @@ configure_firewall() {
             iptables -A INPUT -p udp --dport $P2P_PORT2 -j ACCEPT
 
             # Save rules
-            service iptables save
+            if command -v service &> /dev/null; then
+                service iptables save 2>/dev/null || true
+            elif [[ -f /etc/sysconfig/iptables ]]; then
+                iptables-save > /etc/sysconfig/iptables
+            fi
             ;;
     esac
 
@@ -323,8 +371,12 @@ build_project() {
     # Build release binary
     cargo build --release --target $CARGO_TARGET
 
-    # Strip debug symbols
-    aarch64-linux-gnu-strip target/$CARGO_TARGET/release/$PROJECT_NAME
+    # Strip debug symbols (check if strip tool exists)
+    if command -v aarch64-linux-gnu-strip &> /dev/null; then
+        aarch64-linux-gnu-strip target/$CARGO_TARGET/release/$PROJECT_NAME
+    elif command -v strip &> /dev/null; then
+        strip target/$CARGO_TARGET/release/$PROJECT_NAME
+    fi
 
     # Verify binary
     file target/$CARGO_TARGET/release/$PROJECT_NAME
@@ -580,8 +632,8 @@ bantime = 3600
 EOF
 
     # Restart fail2ban
-    systemctl restart fail2ban
-    systemctl enable fail2ban
+    systemctl restart fail2ban 2>/dev/null || true
+    systemctl enable fail2ban 2>/dev/null || true
 
     log_success "Fail2ban configured"
 }
@@ -671,6 +723,7 @@ main() {
 
     # System preparation
     update_system
+    load_kernel_modules
     install_rust
     configure_system_limits
     configure_firewall
