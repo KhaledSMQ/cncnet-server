@@ -45,7 +45,7 @@ chmod +x install.sh
 sudo ./install.sh
 
 # Or with custom settings
-sudo SERVER_NAME="My CnCNet Server" MAX_CLIENTS=2000 ./install.sh
+sudo SERVER_NAME="[0 UAE] Dubai" MAX_CLIENTS=16 ./install.sh
 ```
 
 ### Option 2: CloudFormation Deployment

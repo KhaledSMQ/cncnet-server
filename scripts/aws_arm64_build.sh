@@ -726,7 +726,7 @@ main() {
     load_kernel_modules
     install_rust
     configure_system_limits
-    configure_firewall
+#    configure_firewall
 
     # User and directories
     create_service_user
