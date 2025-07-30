@@ -8,35 +8,35 @@
 set -euo pipefail
 
 # Color codes for output
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m' # No Color
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
 # Configuration variables
-readonly REPO_URL="https://github.com/khaledsmq/cncnet-server"
-readonly PROJECT_NAME="cncnet-server"
-readonly SERVICE_USER="cncnet"
-readonly INSTALL_DIR="/opt/cncnet-server"
-readonly LOG_DIR="/var/log/cncnet-server"
-readonly CONFIG_DIR="/etc/cncnet-server"
-readonly SYSTEMD_SERVICE="cncnet-server.service"
+REPO_URL="https://github.com/khaledsmq/cncnet-server"
+PROJECT_NAME="cncnet-server"
+SERVICE_USER="cncnet"
+INSTALL_DIR="/opt/cncnet-server"
+LOG_DIR="/var/log/cncnet-server"
+CONFIG_DIR="/etc/cncnet-server"
+SYSTEMD_SERVICE="cncnet-server.service"
 
 # Rust configuration
-readonly RUST_VERSION="stable"
-readonly CARGO_TARGET="aarch64-unknown-linux-gnu"
+RUST_VERSION="stable"
+CARGO_TARGET="aarch64-unknown-linux-gnu"
 
 # Network ports
-readonly V3_PORT="${V3_PORT:-50001}"
-readonly V2_PORT="${V2_PORT:-50000}"
-readonly P2P_PORT1="${P2P_PORT1:-8054}"
-readonly P2P_PORT2="${P2P_PORT2:-3478}"
+V3_PORT="${V3_PORT:-50001}"
+V2_PORT="${V2_PORT:-50000}"
+P2P_PORT1="${P2P_PORT1:-8054}"
+P2P_PORT2="${P2P_PORT2:-3478}"
 
 # Performance tuning defaults
-readonly MAX_CLIENTS="${MAX_CLIENTS:-1000}"
-readonly IP_LIMIT_V3="${IP_LIMIT_V3:-8}"
-readonly IP_LIMIT_V2="${IP_LIMIT_V2:-4}"
+MAX_CLIENTS="${MAX_CLIENTS:-1000}"
+IP_LIMIT_V3="${IP_LIMIT_V3:-8}"
+IP_LIMIT_V2="${IP_LIMIT_V2:-4}"
 
 # Logging functions - ALWAYS output to stderr
 log_info() {
@@ -446,9 +446,6 @@ EOF
 create_systemd_service() {
     log_info "Creating systemd service..."
 
-    # Load configuration
-    source $CONFIG_DIR/server.conf
-
     cat > /etc/systemd/system/$SYSTEMD_SERVICE << EOF
 [Unit]
 Description=CnCNet High-Performance Game Server
@@ -686,7 +683,7 @@ start_services() {
 
 # Display final information
 display_info() {
-    local maint_pw=$(grep MAINT_PASSWORD $CONFIG_DIR/server.conf | cut -d'"' -f2)
+    local maint_pw=$(grep MAINT_PASSWORD $CONFIG_DIR/server.conf | cut -d'=' -f2 | cut -d'"' -f2)
 
     echo >&2
     echo "=========================================" >&2
