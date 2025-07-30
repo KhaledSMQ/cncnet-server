@@ -550,7 +550,7 @@ MAINT_PASSWORD="${MAINT_PASSWORD}"
 LOG_LEVEL="${LOG_LEVEL}"
 
 EOF
-        chmod 600 $CONFIG_DIR/server.conf
+      chmod 644 $CONFIG_DIR/server.conf
     fi
 
     # Clean up build directory
