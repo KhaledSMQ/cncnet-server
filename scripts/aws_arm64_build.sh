@@ -47,6 +47,9 @@ IP_LIMIT_V2="${IP_LIMIT_V2:-4}"
 # Logging configuration
 LOG_LEVEL="${LOG_LEVEL:-info}"
 
+# Installation mode
+FORCE_REINSTALL="${FORCE_REINSTALL:-false}"
+
 # Logging functions - ALWAYS output to stderr
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1" >&2
@@ -69,6 +72,45 @@ check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "This script must be run as root"
         exit 1
+    fi
+}
+
+# Check for existing installation
+check_existing_installation() {
+    log_info "Checking for existing installation..."
+
+    local has_existing=false
+
+    if [[ -f /etc/systemd/system/$SYSTEMD_SERVICE ]]; then
+        log_warn "Found existing systemd service: $SYSTEMD_SERVICE"
+        has_existing=true
+    fi
+
+    if [[ -d $INSTALL_DIR && -f $INSTALL_DIR/$PROJECT_NAME ]]; then
+        log_warn "Found existing installation in: $INSTALL_DIR"
+        has_existing=true
+    fi
+
+    if [[ "$has_existing" == "true" && "$FORCE_REINSTALL" != "true" ]]; then
+        log_error "Existing installation detected. To reinstall, run with FORCE_REINSTALL=true"
+        log_info "Example: FORCE_REINSTALL=true $0"
+        exit 1
+    fi
+
+    if [[ "$has_existing" == "true" && "$FORCE_REINSTALL" == "true" ]]; then
+        log_warn "Force reinstall requested. Cleaning up existing installation..."
+
+        # Stop and disable service if running
+        if systemctl is-active --quiet $SYSTEMD_SERVICE; then
+            systemctl stop $SYSTEMD_SERVICE
+        fi
+        if systemctl is-enabled --quiet $SYSTEMD_SERVICE; then
+            systemctl disable $SYSTEMD_SERVICE
+        fi
+
+        # Remove service file
+        rm -f /etc/systemd/system/$SYSTEMD_SERVICE
+        systemctl daemon-reload
     fi
 }
 
@@ -107,7 +149,8 @@ update_system() {
                 rsyslog \
                 logrotate \
                 chrony \
-                conntrack
+                conntrack \
+                cron
             ;;
         amzn|centos|rhel|fedora)
             yum update -y
@@ -124,7 +167,9 @@ update_system() {
                 rsyslog \
                 logrotate \
                 chrony \
-                conntrack-tools
+                conntrack-tools \
+                cronie \
+                crontabs
             ;;
         *)
             log_error "Unsupported distribution: $OS"
@@ -137,6 +182,25 @@ update_system() {
 
 # Install Rust for ARM64
 install_rust() {
+    log_info "Checking Rust installation..."
+
+    # Check if Rust is already installed
+    if command -v rustc &> /dev/null && command -v cargo &> /dev/null; then
+        local installed_version=$(rustc --version | awk '{print $2}')
+        log_info "Rust is already installed (version: $installed_version)"
+
+        # Source cargo env just in case
+        if [[ -f "$HOME/.cargo/env" ]]; then
+            source "$HOME/.cargo/env"
+        fi
+
+        # Ensure ARM64 target is added
+        rustup target add $CARGO_TARGET 2>/dev/null || true
+
+        log_success "Rust verified"
+        return
+    fi
+
     log_info "Installing Rust for ARM64..."
 
     # Install rustup
@@ -145,14 +209,16 @@ install_rust() {
     # Source cargo env
     source "$HOME/.cargo/env"
 
-    # Add to profile
-    echo 'source $HOME/.cargo/env' >> ~/.bashrc
+    # Add to profile if not already there
+    if ! grep -q 'source $HOME/.cargo/env' ~/.bashrc; then
+        echo 'source $HOME/.cargo/env' >> ~/.bashrc
+    fi
 
     # Verify installation
     rustc --version >&2
     cargo --version >&2
 
-    # Add ARM64 target (should be default on ARM64, but ensure it's there)
+    # Add ARM64 target
     rustup target add $CARGO_TARGET
 
     log_success "Rust installed successfully"
@@ -183,12 +249,17 @@ load_kernel_modules() {
 
     # Make modules persistent if the directory exists
     if [[ -d /etc/modules-load.d ]]; then
-        echo "# Netfilter connection tracking modules" > /etc/modules-load.d/netfilter.conf
-        for module in "${modules[@]}"; do
-            if lsmod | grep -q "^$module"; then
-                echo "$module" >> /etc/modules-load.d/netfilter.conf
-            fi
-        done
+        # Check if already configured
+        if [[ ! -f /etc/modules-load.d/netfilter.conf ]]; then
+            echo "# Netfilter connection tracking modules" > /etc/modules-load.d/netfilter.conf
+            for module in "${modules[@]}"; do
+                if lsmod | grep -q "^$module"; then
+                    echo "$module" >> /etc/modules-load.d/netfilter.conf
+                fi
+            done
+        else
+            log_info "Kernel modules already configured"
+        fi
     fi
 
     log_success "Kernel modules configured"
@@ -198,12 +269,17 @@ load_kernel_modules() {
 configure_system_limits() {
     log_info "Configuring system limits for high performance..."
 
-    # Backup original files
-    cp /etc/security/limits.conf /etc/security/limits.conf.backup
-    cp /etc/sysctl.conf /etc/sysctl.conf.backup
+    # Backup original files if not already backed up
+    if [[ ! -f /etc/security/limits.conf.backup ]]; then
+        cp /etc/security/limits.conf /etc/security/limits.conf.backup
+    fi
+    if [[ ! -f /etc/sysctl.conf.backup ]]; then
+        cp /etc/sysctl.conf /etc/sysctl.conf.backup
+    fi
 
-    # Configure limits.conf
-    cat >> /etc/security/limits.conf << EOF
+    # Check if limits are already configured
+    if ! grep -q "# CnCNet Server Limits" /etc/security/limits.conf; then
+        cat >> /etc/security/limits.conf << EOF
 
 # CnCNet Server Limits
 $SERVICE_USER soft nofile 1048576
@@ -213,9 +289,13 @@ $SERVICE_USER hard nproc 65536
 $SERVICE_USER soft memlock unlimited
 $SERVICE_USER hard memlock unlimited
 EOF
+    else
+        log_info "System limits already configured"
+    fi
 
-    # Configure sysctl for network performance
-    cat >> /etc/sysctl.conf << EOF
+    # Check if sysctl settings are already configured
+    if ! grep -q "# CnCNet Server Network Optimizations" /etc/sysctl.conf; then
+        cat >> /etc/sysctl.conf << EOF
 
 # CnCNet Server Network Optimizations
 # Increase system IP port limits
@@ -243,19 +323,19 @@ net.ipv4.tcp_sack = 1
 net.ipv4.tcp_timestamps = 1
 EOF
 
-    # Only add BBR if it's available
-    if modinfo tcp_bbr &>/dev/null; then
-        cat >> /etc/sysctl.conf << EOF
+        # Only add BBR if it's available
+        if modinfo tcp_bbr &>/dev/null; then
+            cat >> /etc/sysctl.conf << EOF
 
 # Enable BBR congestion control (if available)
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-    fi
+        fi
 
-    # Add connection tracking settings only if the module is loaded
-    if lsmod | grep -q nf_conntrack; then
-        cat >> /etc/sysctl.conf << EOF
+        # Add connection tracking settings only if the module is loaded
+        if lsmod | grep -q nf_conntrack; then
+            cat >> /etc/sysctl.conf << EOF
 
 # Connection tracking for NAT (if available)
 net.netfilter.nf_conntrack_max = 1048576
@@ -263,6 +343,9 @@ net.nf_conntrack_max = 1048576
 net.netfilter.nf_conntrack_udp_timeout = 30
 net.netfilter.nf_conntrack_udp_timeout_stream = 60
 EOF
+        fi
+    else
+        log_info "Sysctl settings already configured"
     fi
 
     # Apply sysctl settings, ignoring errors for missing parameters
@@ -274,6 +357,27 @@ EOF
 # Configure firewall rules
 configure_firewall() {
     log_info "Configuring firewall rules..."
+
+    # Check if rules already exist
+    local rules_exist=false
+
+    case $OS in
+        ubuntu|debian)
+            if command -v ufw &> /dev/null && ufw status | grep -q "$V3_PORT/udp"; then
+                rules_exist=true
+            fi
+            ;;
+        amzn|centos|rhel|fedora)
+            if iptables -L INPUT -n | grep -q "CnCNet"; then
+                rules_exist=true
+            fi
+            ;;
+    esac
+
+    if [[ "$rules_exist" == "true" ]]; then
+        log_info "Firewall rules already configured"
+        return
+    fi
 
     # For Amazon Linux, we'll use iptables directly
     case $OS in
@@ -342,7 +446,7 @@ create_service_user() {
     log_info "Creating service user..."
 
     if id "$SERVICE_USER" &>/dev/null; then
-        log_warn "User $SERVICE_USER already exists"
+        log_info "User $SERVICE_USER already exists"
     else
         useradd -r -s /sbin/nologin -d $INSTALL_DIR -c "CnCNet Server" $SERVICE_USER
         log_success "Service user created"
@@ -405,8 +509,13 @@ install_application() {
     chown -R $SERVICE_USER:$SERVICE_USER $INSTALL_DIR
     chown -R $SERVICE_USER:$SERVICE_USER $LOG_DIR
 
-    # Create default configuration
-    cat > $CONFIG_DIR/server.conf << EOF
+    # Create or update configuration
+    if [[ -f $CONFIG_DIR/server.conf ]]; then
+        log_info "Configuration file already exists, preserving existing settings"
+        # Backup existing config
+        cp $CONFIG_DIR/server.conf $CONFIG_DIR/server.conf.$(date +%Y%m%d_%H%M%S)
+    else
+        cat > $CONFIG_DIR/server.conf << EOF
 # CnCNet Server Configuration
 # Generated on $(date)
 
@@ -433,8 +542,8 @@ MAINT_PASSWORD="${MAINT_PASSWORD}"
 LOG_LEVEL="${LOG_LEVEL}"
 
 EOF
-
-    chmod 600 $CONFIG_DIR/server.conf
+        chmod 600 $CONFIG_DIR/server.conf
+    fi
 
     # Clean up build directory
     rm -rf $build_dir
@@ -445,6 +554,12 @@ EOF
 # Create systemd service
 create_systemd_service() {
     log_info "Creating systemd service..."
+
+    # Check if service already exists
+    if [[ -f /etc/systemd/system/$SYSTEMD_SERVICE ]]; then
+        log_info "Systemd service already exists, updating..."
+        systemctl stop $SYSTEMD_SERVICE 2>/dev/null || true
+    fi
 
     cat > /etc/systemd/system/$SYSTEMD_SERVICE << EOF
 [Unit]
@@ -520,8 +635,15 @@ EOF
 configure_logging() {
     log_info "Configuring logging..."
 
-    # Create rsyslog configuration
-    cat > /etc/rsyslog.d/50-cncnet.conf << 'EOF'
+    # Ensure rsyslog.d directory exists
+    if [[ ! -d /etc/rsyslog.d ]]; then
+        mkdir -p /etc/rsyslog.d
+    fi
+
+    # Check if rsyslog configuration already exists
+    if [[ ! -f /etc/rsyslog.d/50-cncnet.conf ]]; then
+        # Create rsyslog configuration
+        cat > /etc/rsyslog.d/50-cncnet.conf << 'EOF'
 # CnCNet Server Logging Configuration
 if $programname == 'cncnet-server' then {
     # Log to dedicated file
@@ -536,9 +658,19 @@ if $programname == 'cncnet-server' then {
     stop
 }
 EOF
+    else
+        log_info "Rsyslog configuration already exists"
+    fi
 
-    # Create logrotate configuration
-    cat > /etc/logrotate.d/cncnet-server << EOF
+    # Ensure logrotate.d directory exists
+    if [[ ! -d /etc/logrotate.d ]]; then
+        mkdir -p /etc/logrotate.d
+    fi
+
+    # Check if logrotate configuration already exists
+    if [[ ! -f /etc/logrotate.d/cncnet-server ]]; then
+        # Create logrotate configuration
+        cat > /etc/logrotate.d/cncnet-server << EOF
 $LOG_DIR/*.log {
     daily
     rotate 14
@@ -553,9 +685,14 @@ $LOG_DIR/*.log {
     endscript
 }
 EOF
+    else
+        log_info "Logrotate configuration already exists"
+    fi
 
-    # Restart rsyslog
-    systemctl restart rsyslog
+    # Restart rsyslog if it exists
+    if systemctl list-unit-files | grep -q "rsyslog.service"; then
+        systemctl restart rsyslog 2>/dev/null || true
+    fi
 
     log_success "Logging configured"
 }
@@ -596,10 +733,30 @@ EOF
     chmod +x $INSTALL_DIR/health_check.sh
 
     # Create cron job for monitoring
-    cat > /etc/cron.d/cncnet-monitor << EOF
+    # First check if cron.d directory exists, create if needed
+    if [[ ! -d /etc/cron.d ]]; then
+        mkdir -p /etc/cron.d
+    fi
+
+    # Check if cron job already exists
+    if [[ ! -f /etc/cron.d/cncnet-monitor ]]; then
+        cat > /etc/cron.d/cncnet-monitor << EOF
 # CnCNet Server Monitoring
 */5 * * * * root $INSTALL_DIR/health_check.sh || systemctl restart cncnet-server
 EOF
+
+        # Set proper permissions for cron file
+        chmod 644 /etc/cron.d/cncnet-monitor
+    else
+        log_info "Cron monitoring job already exists"
+    fi
+
+    # Restart cron service if it exists
+    if systemctl list-unit-files | grep -q "crond.service"; then
+        systemctl restart crond 2>/dev/null || true
+    elif systemctl list-unit-files | grep -q "cron.service"; then
+        systemctl restart cron 2>/dev/null || true
+    fi
 
     log_success "Monitoring configured"
 }
@@ -614,16 +771,23 @@ configure_fail2ban() {
         return
     fi
 
-    # Create fail2ban filter
-    cat > /etc/fail2ban/filter.d/cncnet.conf << 'EOF'
+    # Check if filter already exists
+    if [[ ! -f /etc/fail2ban/filter.d/cncnet.conf ]]; then
+        # Create fail2ban filter
+        cat > /etc/fail2ban/filter.d/cncnet.conf << 'EOF'
 [Definition]
 failregex = Rate limit exceeded for IP: <HOST>
             Rate limit exceeded for <HOST>
 ignoreregex =
 EOF
+    else
+        log_info "Fail2ban filter already exists"
+    fi
 
-    # Create fail2ban jail
-    cat > /etc/fail2ban/jail.d/cncnet.conf << EOF
+    # Check if jail already exists
+    if [[ ! -f /etc/fail2ban/jail.d/cncnet.conf ]]; then
+        # Create fail2ban jail
+        cat > /etc/fail2ban/jail.d/cncnet.conf << EOF
 [cncnet]
 enabled = true
 filter = cncnet
@@ -633,6 +797,9 @@ maxretry = 5
 findtime = 60
 bantime = 3600
 EOF
+    else
+        log_info "Fail2ban jail already exists"
+    fi
 
     # Restart fail2ban
     systemctl restart fail2ban 2>/dev/null || true
@@ -647,11 +814,21 @@ tune_arm64_performance() {
 
     # Set CPU governor to performance if available
     if [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
+        local governor_changed=false
         for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
             if [[ -w $cpu ]]; then
-                echo performance > $cpu 2>/dev/null || true
+                current_governor=$(cat $cpu 2>/dev/null || echo "unknown")
+                if [[ "$current_governor" != "performance" ]]; then
+                    echo performance > $cpu 2>/dev/null && governor_changed=true || true
+                fi
             fi
         done
+
+        if [[ "$governor_changed" == "true" ]]; then
+            log_info "CPU governor set to performance mode"
+        else
+            log_info "CPU governor already in performance mode or cannot be changed"
+        fi
     fi
 
     # Disable CPU frequency scaling service if exists
@@ -694,7 +871,11 @@ start_services() {
 
 # Display final information
 display_info() {
-    local maint_pw=$(grep MAINT_PASSWORD $CONFIG_DIR/server.conf | cut -d'=' -f2 | cut -d'"' -f2)
+    # Read maintenance password from config
+    local maint_pw=""
+    if [[ -f $CONFIG_DIR/server.conf ]]; then
+        maint_pw=$(grep MAINT_PASSWORD $CONFIG_DIR/server.conf | cut -d'=' -f2 | cut -d'"' -f2)
+    fi
 
     echo >&2
     echo "=========================================" >&2
@@ -710,7 +891,9 @@ display_info() {
     echo "  - Tunnel V2: UDP/TCP $V2_PORT" >&2
     echo "  - P2P NAT:   UDP $P2P_PORT1, $P2P_PORT2" >&2
     echo >&2
-    echo "Maintenance Password: $maint_pw" >&2
+    if [[ -n "$maint_pw" ]]; then
+        echo "Maintenance Password: $maint_pw" >&2
+    fi
     echo >&2
     echo "IMPORTANT: Configure AWS Security Group to allow:" >&2
     echo "  - UDP $V3_PORT (from 0.0.0.0/0)" >&2
@@ -733,6 +916,7 @@ main() {
 
     # Pre-flight checks
     check_root
+    check_existing_installation
     detect_distro
 
     # System preparation
