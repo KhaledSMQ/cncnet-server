@@ -522,17 +522,13 @@ install_application() {
         # Backup existing config
         cp $CONFIG_DIR/server.conf $CONFIG_DIR/server.conf.$(date +%Y%m%d_%H%M%S)
     else
-        # Escape special characters in variables for safe storage
-        local escaped_server_name=$(escape_systemd_string "$SERVER_NAME")
-        local escaped_master_url=$(escape_systemd_string "$MASTER_URL")
-        local escaped_maint_password=$(escape_systemd_string "$MAINT_PASSWORD")
-
+        # Don't escape values in the config file - they should be stored as-is
         cat > $CONFIG_DIR/server.conf << EOF
 # CnCNet Server Configuration
 # Generated on $(date)
 
 # Server identification
-SERVER_NAME="${escaped_server_name}"
+SERVER_NAME="${SERVER_NAME}"
 
 # Network ports
 V3_PORT=$V3_PORT
@@ -544,11 +540,11 @@ IP_LIMIT_V3=$IP_LIMIT_V3
 IP_LIMIT_V2=$IP_LIMIT_V2
 
 # Master server
-MASTER_URL="${escaped_master_url}"
+MASTER_URL="${MASTER_URL}"
 NO_MASTER="${NO_MASTER}"
 
 # Security
-MAINT_PASSWORD="${escaped_maint_password}"
+MAINT_PASSWORD="${MAINT_PASSWORD}"
 
 # Logging
 LOG_LEVEL="${LOG_LEVEL}"
@@ -648,9 +644,26 @@ EOF
 # CnCNet Server startup wrapper
 # This script ensures proper argument handling for special characters
 
+# Enable debugging if needed
+if [[ "${DEBUG_WRAPPER}" == "true" ]]; then
+    set -x
+fi
+
 # Source configuration
 if [[ -f /etc/cncnet-server/server.conf ]]; then
     source /etc/cncnet-server/server.conf
+else
+    echo "ERROR: Configuration file not found at /etc/cncnet-server/server.conf" >&2
+    exit 1
+fi
+
+# Validate required variables
+if [[ -z "$V3_PORT" ]] || [[ -z "$V2_PORT" ]] || [[ -z "$SERVER_NAME" ]]; then
+    echo "ERROR: Required configuration variables are missing" >&2
+    echo "V3_PORT=$V3_PORT" >&2
+    echo "V2_PORT=$V2_PORT" >&2
+    echo "SERVER_NAME=$SERVER_NAME" >&2
+    exit 1
 fi
 
 # Build command array
@@ -667,6 +680,11 @@ CMD+=(--maintpw "$MAINT_PASSWORD")
 # Add optional parameters
 if [[ "$NO_MASTER" == "true" ]]; then
     CMD+=(--nomaster)
+fi
+
+# Log the command being executed (useful for debugging)
+if [[ "${DEBUG_WRAPPER}" == "true" ]] || [[ "${RUST_LOG}" == "debug" ]]; then
+    echo "Executing command: ${CMD[@]}" >&2
 fi
 
 # Execute with proper argument handling
@@ -719,6 +737,7 @@ StartLimitBurst=5
 # Environment
 Environment="RUST_LOG=${LOG_LEVEL}"
 Environment="RUST_BACKTRACE=1"
+Environment="DEBUG_WRAPPER=false"
 
 # Use wrapper script for better argument handling
 ExecStart=$INSTALL_DIR/start-server.sh
