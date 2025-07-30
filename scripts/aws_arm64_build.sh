@@ -33,16 +33,19 @@ V2_PORT="${V2_PORT:-50000}"
 P2P_PORT1="${P2P_PORT1:-8054}"
 P2P_PORT2="${P2P_PORT2:-3478}"
 
-
+# Server configuration
 SERVER_NAME="${SERVER_NAME:-CnCNet Server}"
 MASTER_URL="${MASTER_URL:-http://cncnet.org/master-announce}"
 NO_MASTER="${NO_MASTER:-false}"
 MAINT_PASSWORD="${MAINT_PASSWORD:-$(openssl rand -base64 12)}"
 
 # Performance tuning defaults
-MAX_CLIENTS="${MAX_CLIENTS:-1000}"
+MAX_CLIENTS="${MAX_CLIENTS:-200}"
 IP_LIMIT_V3="${IP_LIMIT_V3:-8}"
 IP_LIMIT_V2="${IP_LIMIT_V2:-4}"
+
+# Logging configuration
+LOG_LEVEL="${LOG_LEVEL:-info}"
 
 # Logging functions - ALWAYS output to stderr
 log_info() {
@@ -155,39 +158,43 @@ install_rust() {
     log_success "Rust installed successfully"
 }
 
-# Load necessary kernel modules
+# Load necessary kernel modules (AWS-safe version)
 load_kernel_modules() {
     log_info "Loading kernel modules for connection tracking..."
 
-    # Load netfilter modules
+    # Only try to load modules that exist on Amazon Linux
     local modules=(
         "nf_conntrack"
-        "nf_conntrack_ipv4"
-        "nf_conntrack_ipv6"
-        "nf_conntrack_netlink"
-        "xt_conntrack"
     )
 
     for module in "${modules[@]}"; do
-        if modprobe $module 2>/dev/null; then
-            log_info "Loaded module: $module"
+        if lsmod | grep -q "^$module"; then
+            log_info "Module already loaded: $module"
+        elif modprobe -n $module 2>/dev/null; then
+            if modprobe $module 2>/dev/null; then
+                log_info "Loaded module: $module"
+            else
+                log_warn "Could not load module: $module"
+            fi
         else
-            log_warn "Could not load module: $module (may not exist on this kernel)"
+            log_warn "Module not available: $module"
         fi
     done
 
-    # Make modules persistent
+    # Make modules persistent if the directory exists
     if [[ -d /etc/modules-load.d ]]; then
         echo "# Netfilter connection tracking modules" > /etc/modules-load.d/netfilter.conf
         for module in "${modules[@]}"; do
-            echo "$module" >> /etc/modules-load.d/netfilter.conf
+            if lsmod | grep -q "^$module"; then
+                echo "$module" >> /etc/modules-load.d/netfilter.conf
+            fi
         done
     fi
 
     log_success "Kernel modules configured"
 }
 
-# Configure system limits for high performance
+# Configure system limits for high performance (AWS-safe)
 configure_system_limits() {
     log_info "Configuring system limits for high performance..."
 
@@ -222,31 +229,29 @@ net.ipv4.tcp_wmem = 4096 65536 134217728
 
 # Increase UDP buffer sizes
 net.core.netdev_max_backlog = 30000
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
 
 # Enable TCP Fast Open
 net.ipv4.tcp_fastopen = 3
 
-# Security hardening
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_rfc1337 = 1
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
-
 # Increase socket listen backlog
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
-
-# Enable BBR congestion control if available
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
 
 # Optimize for low latency
 net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_timestamps = 1
 EOF
+
+    # Only add BBR if it's available
+    if modinfo tcp_bbr &>/dev/null; then
+        cat >> /etc/sysctl.conf << EOF
+
+# Enable BBR congestion control (if available)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    fi
 
     # Add connection tracking settings only if the module is loaded
     if lsmod | grep -q nf_conntrack; then
@@ -258,8 +263,6 @@ net.nf_conntrack_max = 1048576
 net.netfilter.nf_conntrack_udp_timeout = 30
 net.netfilter.nf_conntrack_udp_timeout_stream = 60
 EOF
-    else
-        log_warn "Connection tracking modules not available - skipping conntrack settings"
     fi
 
     # Apply sysctl settings, ignoring errors for missing parameters
@@ -272,7 +275,7 @@ EOF
 configure_firewall() {
     log_info "Configuring firewall rules..."
 
-    # Enable firewall
+    # For Amazon Linux, we'll use iptables directly
     case $OS in
         ubuntu|debian)
             # Install ufw if not present
@@ -298,46 +301,36 @@ configure_firewall() {
             ;;
 
         amzn|centos|rhel|fedora)
-            # Configure iptables
-            systemctl enable iptables 2>/dev/null || true
-            systemctl start iptables 2>/dev/null || true
+            # For Amazon Linux, we'll add rules without changing default policies
+            # This prevents losing SSH access
+
+            # Check if iptables service exists
+            if systemctl list-unit-files | grep -q iptables.service; then
+                systemctl enable iptables 2>/dev/null || true
+                systemctl start iptables 2>/dev/null || true
+            fi
 
             # Save current rules
             if command -v iptables-save &> /dev/null; then
-                iptables-save > /etc/sysconfig/iptables.backup 2>/dev/null || true
+                iptables-save > /tmp/iptables.backup 2>/dev/null || true
             fi
 
-            # Clear existing rules
-            iptables -F
-            iptables -X
+            # Add CnCNet rules without modifying existing AWS security group rules
+            # Allow CnCNet ports (INPUT)
+            iptables -I INPUT 1 -p udp --dport $V3_PORT -j ACCEPT -m comment --comment "CnCNet V3"
+            iptables -I INPUT 1 -p udp --dport $V2_PORT -j ACCEPT -m comment --comment "CnCNet V2 UDP"
+            iptables -I INPUT 1 -p tcp --dport $V2_PORT -j ACCEPT -m comment --comment "CnCNet V2 HTTP"
+            iptables -I INPUT 1 -p udp --dport $P2P_PORT1 -j ACCEPT -m comment --comment "CnCNet P2P"
+            iptables -I INPUT 1 -p udp --dport $P2P_PORT2 -j ACCEPT -m comment --comment "CnCNet STUN"
 
-            # Default policies
-            iptables -P INPUT DROP
-            iptables -P FORWARD DROP
-            iptables -P OUTPUT ACCEPT
-
-            # Allow loopback
-            iptables -A INPUT -i lo -j ACCEPT
-
-            # Allow established connections
-            iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-            # Allow SSH
-            iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-
-            # Allow CnCNet ports
-            iptables -A INPUT -p udp --dport $V3_PORT -j ACCEPT
-            iptables -A INPUT -p udp --dport $V2_PORT -j ACCEPT
-            iptables -A INPUT -p tcp --dport $V2_PORT -j ACCEPT
-            iptables -A INPUT -p udp --dport $P2P_PORT1 -j ACCEPT
-            iptables -A INPUT -p udp --dport $P2P_PORT2 -j ACCEPT
-
-            # Save rules
-            if command -v service &> /dev/null; then
-                service iptables save 2>/dev/null || true
-            elif [[ -f /etc/sysconfig/iptables ]]; then
+            # Save rules based on the system
+            if [[ -f /etc/sysconfig/iptables ]]; then
                 iptables-save > /etc/sysconfig/iptables
+            elif command -v netfilter-persistent &> /dev/null; then
+                netfilter-persistent save
             fi
+
+            log_warn "Remember to also configure AWS Security Group to allow ports: $V3_PORT/udp, $V2_PORT/tcp+udp, $P2P_PORT1/udp, $P2P_PORT2/udp"
             ;;
     esac
 
@@ -418,7 +411,7 @@ install_application() {
 # Generated on $(date)
 
 # Server identification
-SERVER_NAME="${SERVER_NAME:-CnCNet Server}"
+SERVER_NAME="${SERVER_NAME}"
 
 # Network ports
 V3_PORT=$V3_PORT
@@ -430,14 +423,14 @@ IP_LIMIT_V3=$IP_LIMIT_V3
 IP_LIMIT_V2=$IP_LIMIT_V2
 
 # Master server
-MASTER_URL="${MASTER_URL:-http://cncnet.org/master-announce}"
-NO_MASTER="${NO_MASTER:-false}"
+MASTER_URL="${MASTER_URL}"
+NO_MASTER="${NO_MASTER}"
 
 # Security
-MAINT_PASSWORD="${MAINT_PASSWORD:-$(openssl rand -base64 12)}"
+MAINT_PASSWORD="${MAINT_PASSWORD}"
 
 # Logging
-LOG_LEVEL="${LOG_LEVEL:-info}"
+LOG_LEVEL="${LOG_LEVEL}"
 
 EOF
 
@@ -493,7 +486,7 @@ StartLimitInterval=300
 StartLimitBurst=5
 
 # Environment
-Environment="RUST_LOG=$LOG_LEVEL"
+Environment="RUST_LOG=${LOG_LEVEL}"
 Environment="RUST_BACKTRACE=1"
 
 # Command with all parameters
@@ -615,6 +608,12 @@ EOF
 configure_fail2ban() {
     log_info "Configuring fail2ban..."
 
+    # Check if fail2ban is installed
+    if ! command -v fail2ban-client &> /dev/null; then
+        log_warn "fail2ban not installed, skipping configuration"
+        return
+    fi
+
     # Create fail2ban filter
     cat > /etc/fail2ban/filter.d/cncnet.conf << 'EOF'
 [Definition]
@@ -646,10 +645,12 @@ EOF
 tune_arm64_performance() {
     log_info "Tuning ARM64 performance..."
 
-    # Set CPU governor to performance
-    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+    # Set CPU governor to performance if available
+    if [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
         for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-            echo performance > $cpu 2>/dev/null || true
+            if [[ -w $cpu ]]; then
+                echo performance > $cpu 2>/dev/null || true
+            fi
         done
     fi
 
@@ -657,11 +658,14 @@ tune_arm64_performance() {
     systemctl stop cpufrequtils 2>/dev/null || true
     systemctl disable cpufrequtils 2>/dev/null || true
 
-    # Set IRQ affinity for network interfaces
-    # This spreads network interrupts across all CPU cores
-    for irq in $(grep -E 'eth|ens|enp' /proc/interrupts | awk '{print $1}' | sed 's/://'); do
-        echo ff > /proc/irq/$irq/smp_affinity 2>/dev/null || true
-    done
+    # Set IRQ affinity for network interfaces (if accessible)
+    if [[ -r /proc/interrupts ]]; then
+        for irq in $(grep -E 'eth|ens|enp' /proc/interrupts | awk '{print $1}' | sed 's/://'); do
+            if [[ -w /proc/irq/$irq/smp_affinity ]]; then
+                echo ff > /proc/irq/$irq/smp_affinity 2>/dev/null || true
+            fi
+        done
+    fi
 
     log_success "ARM64 performance tuned"
 }
@@ -708,6 +712,12 @@ display_info() {
     echo >&2
     echo "Maintenance Password: $maint_pw" >&2
     echo >&2
+    echo "IMPORTANT: Configure AWS Security Group to allow:" >&2
+    echo "  - UDP $V3_PORT (from 0.0.0.0/0)" >&2
+    echo "  - TCP/UDP $V2_PORT (from 0.0.0.0/0)" >&2
+    echo "  - UDP $P2P_PORT1 (from 0.0.0.0/0)" >&2
+    echo "  - UDP $P2P_PORT2 (from 0.0.0.0/0)" >&2
+    echo >&2
     echo "Useful Commands:" >&2
     echo "  - View logs:     journalctl -u $SYSTEMD_SERVICE -f" >&2
     echo "  - Check status:  systemctl status $SYSTEMD_SERVICE" >&2
@@ -727,10 +737,10 @@ main() {
 
     # System preparation
     update_system
-#    load_kernel_modules
+    load_kernel_modules
     install_rust
-#    configure_system_limits
-#    configure_firewall
+    configure_system_limits
+    configure_firewall
 
     # User and directories
     create_service_user
@@ -741,10 +751,10 @@ main() {
 
     # Service configuration
     create_systemd_service
-#    configure_logging
-#    configure_monitoring
-#    configure_fail2ban
-#    tune_arm64_performance
+    configure_logging
+    configure_monitoring
+    configure_fail2ban
+    tune_arm64_performance
 
     # Start services
     start_services

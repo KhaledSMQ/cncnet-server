@@ -12,7 +12,7 @@ WorkingDirectory=/opt/cncnet-server
 # Binary path
 ExecStart=/opt/cncnet-server/cncnet-server \
     --name "Production Server" \
-    --maxclients 500 \
+    --maxclients 200 \
     --iplimit 10
 
 # Restart policy
