@@ -33,6 +33,12 @@ V2_PORT="${V2_PORT:-50000}"
 P2P_PORT1="${P2P_PORT1:-8054}"
 P2P_PORT2="${P2P_PORT2:-3478}"
 
+
+SERVER_NAME="${SERVER_NAME:-CnCNet Server}"
+MASTER_URL="${MASTER_URL:-http://cncnet.org/master-announce}"
+NO_MASTER="${NO_MASTER:-false}"
+MAINT_PASSWORD="${MAINT_PASSWORD:-$(openssl rand -base64 12)}"
+
 # Performance tuning defaults
 MAX_CLIENTS="${MAX_CLIENTS:-1000}"
 IP_LIMIT_V3="${IP_LIMIT_V3:-8}"
@@ -432,6 +438,7 @@ MAINT_PASSWORD="${MAINT_PASSWORD:-$(openssl rand -base64 12)}"
 
 # Logging
 LOG_LEVEL="${LOG_LEVEL:-info}"
+
 EOF
 
     chmod 600 $CONFIG_DIR/server.conf
