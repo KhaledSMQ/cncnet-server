@@ -67,6 +67,13 @@ log_warn() {
     echo -e "${YELLOW}[WARN]${NC} $1" >&2
 }
 
+# Function to escape strings for systemd
+escape_systemd_string() {
+    local input="$1"
+    # Escape backslashes first, then double quotes
+    echo "$input" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g'
+}
+
 # Check if running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -515,12 +522,17 @@ install_application() {
         # Backup existing config
         cp $CONFIG_DIR/server.conf $CONFIG_DIR/server.conf.$(date +%Y%m%d_%H%M%S)
     else
+        # Escape special characters in variables for safe storage
+        local escaped_server_name=$(escape_systemd_string "$SERVER_NAME")
+        local escaped_master_url=$(escape_systemd_string "$MASTER_URL")
+        local escaped_maint_password=$(escape_systemd_string "$MAINT_PASSWORD")
+
         cat > $CONFIG_DIR/server.conf << EOF
 # CnCNet Server Configuration
 # Generated on $(date)
 
 # Server identification
-SERVER_NAME="${SERVER_NAME}"
+SERVER_NAME="${escaped_server_name}"
 
 # Network ports
 V3_PORT=$V3_PORT
@@ -532,11 +544,11 @@ IP_LIMIT_V3=$IP_LIMIT_V3
 IP_LIMIT_V2=$IP_LIMIT_V2
 
 # Master server
-MASTER_URL="${MASTER_URL}"
+MASTER_URL="${escaped_master_url}"
 NO_MASTER="${NO_MASTER}"
 
 # Security
-MAINT_PASSWORD="${MAINT_PASSWORD}"
+MAINT_PASSWORD="${escaped_maint_password}"
 
 # Logging
 LOG_LEVEL="${LOG_LEVEL}"
@@ -561,6 +573,12 @@ create_systemd_service() {
         systemctl stop $SYSTEMD_SERVICE 2>/dev/null || true
     fi
 
+    # Escape special characters for systemd
+    local escaped_server_name=$(escape_systemd_string "$SERVER_NAME")
+    local escaped_master_url=$(escape_systemd_string "$MASTER_URL")
+    local escaped_maint_password=$(escape_systemd_string "$MAINT_PASSWORD")
+
+    # Create the service file with proper quoting
     cat > /etc/systemd/system/$SYSTEMD_SERVICE << EOF
 [Unit]
 Description=CnCNet High-Performance Game Server
@@ -604,17 +622,16 @@ StartLimitBurst=5
 Environment="RUST_LOG=${LOG_LEVEL}"
 Environment="RUST_BACKTRACE=1"
 
-# Command with all parameters
+# Command with properly quoted parameters
 ExecStart=$INSTALL_DIR/$PROJECT_NAME \\
-    --port $V3_PORT \\
-    --portv2 $V2_PORT \\
-    --name "$SERVER_NAME" \\
-    --maxclients $MAX_CLIENTS \\
-    --iplimit $IP_LIMIT_V3 \\
-    --iplimitv2 $IP_LIMIT_V2 \\
-    --master "$MASTER_URL" \\
-    --maintpw "$MAINT_PASSWORD" \\
-    \$([ "$NO_MASTER" = "true" ] && echo "--nomaster")
+    --port "$V3_PORT" \\
+    --portv2 "$V2_PORT" \\
+    --name "${escaped_server_name}" \\
+    --maxclients "$MAX_CLIENTS" \\
+    --iplimit "$IP_LIMIT_V3" \\
+    --iplimitv2 "$IP_LIMIT_V2" \\
+    --master "${escaped_master_url}" \\
+    --maintpw "${escaped_maint_password}"$([ "$NO_MASTER" = "true" ] && echo " \\\\\n    --nomaster" || echo "")
 
 # Logging
 StandardOutput=journal
@@ -624,6 +641,99 @@ SyslogIdentifier=cncnet-server
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    # Alternative approach: Create a wrapper script for even better handling
+    cat > $INSTALL_DIR/start-server.sh << 'EOF'
+#!/bin/bash
+# CnCNet Server startup wrapper
+# This script ensures proper argument handling for special characters
+
+# Source configuration
+if [[ -f /etc/cncnet-server/server.conf ]]; then
+    source /etc/cncnet-server/server.conf
+fi
+
+# Build command array
+CMD=(/opt/cncnet-server/cncnet-server)
+CMD+=(--port "$V3_PORT")
+CMD+=(--portv2 "$V2_PORT")
+CMD+=(--name "$SERVER_NAME")
+CMD+=(--maxclients "$MAX_CLIENTS")
+CMD+=(--iplimit "$IP_LIMIT_V3")
+CMD+=(--iplimitv2 "$IP_LIMIT_V2")
+CMD+=(--master "$MASTER_URL")
+CMD+=(--maintpw "$MAINT_PASSWORD")
+
+# Add optional parameters
+if [[ "$NO_MASTER" == "true" ]]; then
+    CMD+=(--nomaster)
+fi
+
+# Execute with proper argument handling
+exec "${CMD[@]}"
+EOF
+
+    chmod +x $INSTALL_DIR/start-server.sh
+    chown $SERVICE_USER:$SERVICE_USER $INSTALL_DIR/start-server.sh
+
+    # Update systemd service to use wrapper script
+    cat > /etc/systemd/system/${SYSTEMD_SERVICE}.new << EOF
+[Unit]
+Description=CnCNet High-Performance Game Server
+Documentation=https://github.com/khaledsmq/cncnet-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=$INSTALL_DIR
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$LOG_DIR
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# Resource limits
+LimitNOFILE=1048576
+LimitNPROC=65536
+TasksMax=65536
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitInterval=300
+StartLimitBurst=5
+
+# Environment
+Environment="RUST_LOG=${LOG_LEVEL}"
+Environment="RUST_BACKTRACE=1"
+
+# Use wrapper script for better argument handling
+ExecStart=$INSTALL_DIR/start-server.sh
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cncnet-server
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Move new service file into place
+    mv /etc/systemd/system/${SYSTEMD_SERVICE}.new /etc/systemd/system/$SYSTEMD_SERVICE
 
     # Reload systemd
     systemctl daemon-reload
