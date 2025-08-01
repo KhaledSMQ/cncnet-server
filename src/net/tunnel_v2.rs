@@ -3,6 +3,84 @@
 //! This module implements the V2 tunnel protocol for CnCNet.
 //! It provides both UDP tunneling and HTTP-based game requests.
 //!
+//! ## Protocol Overview
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────┐
+//! │                         Tunnel V2 Architecture                         │
+//! ├────────────────────────────────────────────────────────────────────────┤
+//! │                                                                        │
+//! │  Game Client A                                    Game Client B        │
+//! │       │                                                 │              │
+//! │       ├──────[UDP Tunnel Traffic]────────┐              │              │
+//! │       │                                  ▼              │              │
+//! │       │                          ┌───────────────┐      │              │
+//! │       │                          │  UDP Socket   │      │              │
+//! │       │                          │   :50000      │      │              │
+//! │       │                          └───────┬───────┘      │              │
+//! │       │                                  │              │              │
+//! │       │                          ┌───────▼───────┐      │              │
+//! │       │                          │ Packet Router │      │              │
+//! │       │                          └───────┬───────┘      │              │
+//! │       │                                  │              │              │
+//! │       │                                  └──────────────┴──────────────┤
+//! │       │                             [Forward to Client B]              │
+//! │       │                                                                │
+//! │       │   [HTTP Game Request]                                          │
+//! │       └────────────┐                                                   │
+//! │                    ▼                                                   │
+//! │            ┌───────────────┐                                           │
+//! │            │  HTTP Server  │                                           │
+//! │            │   :50000      │                                           │
+//! │            └───────┬───────┘                                           │
+//! │                    │                                                   │
+//! │         ┌──────────┴──────────┐                                        │
+//! │         ▼                     ▼                                        │
+//! │   ┌───────────┐         ┌───────────┐                                  │
+//! │   │  /status  │         │ /request  │                                  │
+//! │   │           │         │           │                                  │
+//! │   │ Show free │         │ Allocate  │                                  │
+//! │   │   slots   │         │ game IDs  │                                  │
+//! │   └───────────┘         └───────────┘                                  │
+//! │                                                                        │
+//! │  ┌────────────────────────────────────────────────────────────────┐    │
+//! │  │                        UDP Packet Format                       │    │
+//! │  ├────────────────────────────────────────────────────────────────┤    │
+//! │  │  0-1:  Sender ID (i16 BE)                                      │    │
+//! │  │  2-3:  Receiver ID (i16 BE)                                    │    │
+//! │  │  4+:   Payload Data                                            │    │
+//! │  │                                                                │    │
+//! │  │  Special IDs:                                                  │    │
+//! │  │  - 0,0: Ping packet (50 bytes total)                           │    │
+//! │  └────────────────────────────────────────────────────────────────┘    │
+//! │                                                                        │
+//! │  ┌────────────────────────────────────────────────────────────────┐    │
+//! │  │                    HTTP Endpoints                              │    │
+//! │  ├────────────────────────────────────────────────────────────────┤    │
+//! │  │                                                                │    │
+//! │  │  GET /status                                                   │    │
+//! │  │    Response: "X slots free.\nY slots in use.\n"                │    │
+//! │  │                                                                │    │
+//! │  │  GET /request?clients=N                                        │    │
+//! │  │    Allocates N client IDs (2-8)                                │    │
+//! │  │    Response: "[id1,id2,...,idN]"                               │    │
+//! │  │                                                                │    │
+//! │  │  GET /maintenance/<password>                                   │    │
+//! │  │    Enables maintenance mode                                    │    │
+//! │  │                                                                │    │
+//! │  └────────────────────────────────────────────────────────────────┘    │
+//! │                                                                        │
+//! │  ┌────────────────────────────────────────────────────────────────┐    │
+//! │  │                    Master Server Protocol                      │    │
+//! │  ├────────────────────────────────────────────────────────────────┤    │
+//! │  │                                                                │    │
+//! │  │  Heartbeat every 60 seconds:                                   │    │
+//! │  │  GET /master-announce?version=2&name=...&port=...&clients=...  │    │
+//! │  │                                                                │    │
+//! │  └────────────────────────────────────────────────────────────────┘    │
+//! └────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
 //! Key features:
 //! - UDP socket for game traffic tunneling
 //! - HTTP server for game slot allocation
@@ -13,10 +91,13 @@
 //! - Low memory usage with automatic cleanup
 //! - Bounded concurrent HTTP connections
 //! - Connection pooling for master server requests
+//! - Efficient client ID allocation with free list
 
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -27,6 +108,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use once_cell::sync::Lazy;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use rand::Rng;
 use reqwest;
@@ -71,14 +153,48 @@ const DEFAULT_MAX_REQUESTS_GLOBAL: usize = 1000;
 /// Default counter reset interval in milliseconds
 const DEFAULT_RESET_INTERVAL_MS: u64 = 60_000;
 
-/// HTTP client for master server announcements
-static HTTP_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
-    reqwest::Client::builder()
+/// Maximum URL length for HTTP requests
+const MAX_URL_LENGTH: usize = 2000;
+
+/// Maximum attempts to find a free client ID
+const MAX_ID_ALLOCATION_ATTEMPTS: usize = 50;
+
+/// HTTP client for master server announcements with fallback
+static HTTP_CLIENT: Lazy<Arc<Mutex<Option<reqwest::Client>>>> = Lazy::new(|| {
+    Arc::new(Mutex::new(create_http_client()))
+});
+
+/// Creates HTTP client with error handling
+fn create_http_client() -> Option<reqwest::Client> {
+    match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .pool_max_idle_per_host(1)
+        .user_agent("CnCNet-Rust-Server/1.0")
         .build()
-        .expect("Failed to create HTTP client")
-});
+    {
+        Ok(client) => {
+            info!("HTTP client created successfully");
+            Some(client)
+        }
+        Err(e) => {
+            error!("Failed to create HTTP client: {}", e);
+            error!("Master server announcements will be disabled");
+            None
+        }
+    }
+}
+
+/// Gets HTTP client or attempts to recreate it
+fn get_http_client() -> Option<reqwest::Client> {
+    let mut client_opt = HTTP_CLIENT.lock().unwrap();
+
+    if client_opt.is_none() {
+        // Try to recreate client
+        *client_opt = create_http_client();
+    }
+
+    client_opt.clone()
+}
 
 /// Configuration for the Tunnel V2 service
 #[derive(Debug, Clone)]
@@ -137,31 +253,31 @@ impl Default for TunnelV2Config {
     }
 }
 
-/// Service metrics for monitoring
+/// Service metrics for monitoring with proper memory ordering
 #[derive(Debug)]
-struct ServiceMetrics {
-    /// Total UDP packets received
+pub struct ServiceMetrics {
+    /// Total UDP packets received (relaxed - counter only)
     udp_packets_received: AtomicU64,
-    /// Total UDP packets processed
+    /// Total UDP packets processed (relaxed - counter only)
     udp_packets_processed: AtomicU64,
-    /// Total UDP packets dropped
+    /// Total UDP packets dropped (relaxed - counter only)
     udp_packets_dropped: AtomicU64,
-    /// Total packets tunneled
+    /// Total packets tunneled (relaxed - counter only)
     packets_tunneled: AtomicU64,
-    /// Total HTTP requests received
+    /// Total HTTP requests received (relaxed - counter only)
     http_requests_received: AtomicU64,
-    /// Total HTTP requests processed
+    /// Total HTTP requests processed (relaxed - counter only)
     http_requests_processed: AtomicU64,
-    /// Total HTTP requests rate limited
+    /// Total HTTP requests rate limited (relaxed - counter only)
     http_requests_rate_limited: AtomicU64,
-    /// Total game slots allocated
+    /// Total game slots allocated (relaxed - counter only)
     game_slots_allocated: AtomicU64,
-    /// Current active connections
+    /// Current active connections (AcqRel - needs consistency)
     active_connections: AtomicUsize,
 }
 
 impl ServiceMetrics {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             udp_packets_received: AtomicU64::new(0),
             udp_packets_processed: AtomicU64::new(0),
@@ -172,6 +288,148 @@ impl ServiceMetrics {
             http_requests_rate_limited: AtomicU64::new(0),
             game_slots_allocated: AtomicU64::new(0),
             active_connections: AtomicUsize::new(0),
+        }
+    }
+
+    // Counter increment methods (relaxed ordering is fine)
+    #[inline]
+    pub fn inc_udp_received(&self) {
+        self.udp_packets_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_udp_processed(&self) {
+        self.udp_packets_processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_udp_dropped(&self) {
+        self.udp_packets_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_tunneled(&self) {
+        self.packets_tunneled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_http_received(&self) {
+        self.http_requests_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_http_processed(&self) {
+        self.http_requests_processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_http_rate_limited(&self) {
+        self.http_requests_rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn add_game_slots(&self, count: u64) {
+        self.game_slots_allocated.fetch_add(count, Ordering::Relaxed);
+    }
+
+    // Active connections need stronger ordering for consistency
+    #[inline]
+    pub fn add_active_connections(&self, count: usize) {
+        self.active_connections.fetch_add(count, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub fn sub_active_connections(&self, count: usize) {
+        self.active_connections.fetch_sub(count, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub fn get_active_connections(&self) -> usize {
+        self.active_connections.load(Ordering::Acquire)
+    }
+
+    /// Get a consistent snapshot of all metrics
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        // Use Acquire ordering to ensure we see all updates
+        MetricsSnapshot {
+            udp_packets_received: self.udp_packets_received.load(Ordering::Acquire),
+            udp_packets_processed: self.udp_packets_processed.load(Ordering::Acquire),
+            udp_packets_dropped: self.udp_packets_dropped.load(Ordering::Acquire),
+            packets_tunneled: self.packets_tunneled.load(Ordering::Acquire),
+            http_requests_received: self.http_requests_received.load(Ordering::Acquire),
+            http_requests_processed: self.http_requests_processed.load(Ordering::Acquire),
+            http_requests_rate_limited: self.http_requests_rate_limited.load(Ordering::Acquire),
+            game_slots_allocated: self.game_slots_allocated.load(Ordering::Acquire),
+            active_connections: self.active_connections.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// Immutable snapshot of metrics
+#[derive(Debug, Clone, Copy)]
+pub struct MetricsSnapshot {
+    pub udp_packets_received: u64,
+    pub udp_packets_processed: u64,
+    pub udp_packets_dropped: u64,
+    pub packets_tunneled: u64,
+    pub http_requests_received: u64,
+    pub http_requests_processed: u64,
+    pub http_requests_rate_limited: u64,
+    pub game_slots_allocated: u64,
+    pub active_connections: usize,
+}
+
+/// Client ID allocator using a free list for efficiency
+#[derive(Debug)]
+struct ClientIdAllocator {
+    /// Free list of available IDs
+    free_ids: Mutex<VecDeque<i16>>,
+    /// Next sequential ID to generate
+    next_id: AtomicU64,
+}
+
+impl ClientIdAllocator {
+    fn new() -> Self {
+        Self {
+            free_ids: Mutex::new(VecDeque::with_capacity(1000)),
+            next_id: AtomicU64::new(1), // Start at 1, skip 0
+        }
+    }
+
+    /// Allocates a new client ID or reuses a freed one
+    fn allocate(&self) -> Option<i16> {
+        // First check free list
+        if let Ok(mut free_list) = self.free_ids.lock() {
+            if let Some(id) = free_list.pop_front() {
+                return Some(id);
+            }
+        }
+
+        // Generate new sequential ID
+        let next = self.next_id.fetch_add(1, Ordering::Relaxed);
+
+        // Check if we've exhausted the i16 range
+        if next > i16::MAX as u64 {
+            // Reset counter and clear free list to start fresh
+            self.next_id.store(1, Ordering::Relaxed);
+            if let Ok(mut free_list) = self.free_ids.lock() {
+                free_list.clear();
+            }
+            return self.allocate(); // Recursive retry
+        }
+
+        Some(next as i16)
+    }
+
+    /// Returns an ID to the free list for reuse
+    fn free(&self, id: i16) {
+        if id != 0 { // Don't add 0 to free list
+            if let Ok(mut free_list) = self.free_ids.lock() {
+                // Limit free list size to prevent unbounded growth
+                if free_list.len() < 10000 {
+                    free_list.push_back(id);
+                }
+            }
         }
     }
 }
@@ -196,6 +454,8 @@ pub struct TunnelV2 {
     http_semaphore: Arc<Semaphore>,
     /// Semaphore for UDP packet processing
     processing_semaphore: Arc<Semaphore>,
+    /// Client ID allocator
+    id_allocator: Arc<ClientIdAllocator>,
 }
 
 impl TunnelV2 {
@@ -203,12 +463,15 @@ impl TunnelV2 {
     pub fn with_config(mut config: TunnelV2Config) -> Self {
         // Normalize configuration
         if config.port <= 1024 {
+            warn!("Port {} is privileged, changing to 50000", config.port);
             config.port = 50000;
         }
         if config.max_clients < 2 {
+            warn!("Max clients {} too low, changing to 200", config.max_clients);
             config.max_clients = 200;
         }
         if config.ip_limit < 1 {
+            warn!("IP limit {} too low, changing to 4", config.ip_limit);
             config.ip_limit = 4;
         }
         if config.name.is_empty() {
@@ -267,6 +530,7 @@ impl TunnelV2 {
             metrics: Arc::new(ServiceMetrics::new()),
             http_semaphore,
             processing_semaphore,
+            id_allocator: Arc::new(ClientIdAllocator::new()),
         }
     }
 
@@ -343,6 +607,7 @@ impl TunnelV2 {
             let max_clients = self.config.max_clients;
             let master_pw = self.config.master_password.clone();
             let metrics = self.metrics.clone();
+            let id_allocator = self.id_allocator.clone();
 
             tokio::spawn(async move {
                 let mut interval = time::interval(Duration::from_millis(MASTER_ANNOUNCE_INTERVAL));
@@ -360,6 +625,7 @@ impl TunnelV2 {
                         max_clients,
                         &master_pw,
                         &metrics,
+                        &id_allocator,
                     )
                         .await;
                 }
@@ -377,6 +643,7 @@ impl TunnelV2 {
             self.config.max_clients,
             &self.config.master_password,
             &self.metrics,
+            &self.id_allocator,
         )
             .await;
 
@@ -436,17 +703,18 @@ impl TunnelV2 {
 
                 loop {
                     interval.tick().await;
+                    let snapshot = metrics.snapshot();
                     info!(
                         "V2 metrics - UDP recv: {}, proc: {}, drop: {}, tunnel: {}, HTTP recv: {}, proc: {}, rate_lim: {}, slots: {}, active: {}",
-                        metrics.udp_packets_received.load(Ordering::Relaxed),
-                        metrics.udp_packets_processed.load(Ordering::Relaxed),
-                        metrics.udp_packets_dropped.load(Ordering::Relaxed),
-                        metrics.packets_tunneled.load(Ordering::Relaxed),
-                        metrics.http_requests_received.load(Ordering::Relaxed),
-                        metrics.http_requests_processed.load(Ordering::Relaxed),
-                        metrics.http_requests_rate_limited.load(Ordering::Relaxed),
-                        metrics.game_slots_allocated.load(Ordering::Relaxed),
-                        metrics.active_connections.load(Ordering::Relaxed),
+                        snapshot.udp_packets_received,
+                        snapshot.udp_packets_processed,
+                        snapshot.udp_packets_dropped,
+                        snapshot.packets_tunneled,
+                        snapshot.http_requests_received,
+                        snapshot.http_requests_processed,
+                        snapshot.http_requests_rate_limited,
+                        snapshot.game_slots_allocated,
+                        snapshot.active_connections,
                     );
                 }
             })
@@ -473,11 +741,11 @@ impl TunnelV2 {
                 result = timeout(UDP_OPERATION_TIMEOUT, udp_socket.recv_from(&mut recv_buf)) => {
                     match result {
                         Ok(Ok((size, addr))) => {
-                            self.metrics.udp_packets_received.fetch_add(1, Ordering::Relaxed);
+                            self.metrics.inc_udp_received();
 
                             // Basic validation
                             if size < MIN_PACKET_SIZE || size > MAX_PACKET_SIZE {
-                                self.metrics.udp_packets_dropped.fetch_add(1, Ordering::Relaxed);
+                                self.metrics.inc_udp_dropped();
                                 continue;
                             }
 
@@ -485,7 +753,7 @@ impl TunnelV2 {
                             let permit = match self.processing_semaphore.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => {
-                                    self.metrics.udp_packets_dropped.fetch_add(1, Ordering::Relaxed);
+                                    self.metrics.inc_udp_dropped();
                                     warn!("V2 processing queue full, dropping packet");
                                     continue;
                                 }
@@ -528,7 +796,7 @@ impl TunnelV2 {
 
         // Validate packet
         if !self.is_valid_packet(sender_id, receiver_id, &remote_addr) {
-            self.metrics.udp_packets_dropped.fetch_add(1, Ordering::Relaxed);
+            self.metrics.inc_udp_dropped();
             return;
         }
 
@@ -539,7 +807,7 @@ impl TunnelV2 {
                     debug!("Failed to send ping response: {}", e);
                 }
             }
-            self.metrics.udp_packets_processed.fetch_add(1, Ordering::Relaxed);
+            self.metrics.inc_udp_processed();
             return;
         }
 
@@ -560,14 +828,14 @@ impl TunnelV2 {
                         if let Err(e) = socket.send_to(data, receiver_ep).await {
                             debug!("Failed to forward packet: {}", e);
                         } else {
-                            self.metrics.packets_tunneled.fetch_add(1, Ordering::Relaxed);
+                            self.metrics.inc_tunneled();
                         }
                     }
                 }
             }
         }
 
-        self.metrics.udp_packets_processed.fetch_add(1, Ordering::Relaxed);
+        self.metrics.inc_udp_processed();
     }
 
     /// Validates packet parameters
@@ -589,7 +857,8 @@ impl TunnelV2 {
     /// Checks if ping limit has been reached for an IP
     #[inline]
     pub fn ping_limit_reached(&self, ip: IpAddr) -> bool {
-        !self.global_ping_limiter.try_acquire() || !self.ping_manager.try_acquire(ip)
+        // Check per-IP first (cheaper), then global
+        !self.ping_manager.try_acquire(ip) || !self.global_ping_limiter.try_acquire()
     }
 
     /// Handles HTTP requests
@@ -599,13 +868,26 @@ impl TunnelV2 {
         remote_addr: SocketAddr,
         mappings: Arc<DashMap<i16, TunnelClient>>,
     ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-        self.metrics.http_requests_received.fetch_add(1, Ordering::Relaxed);
+        self.metrics.inc_http_received();
 
         let path = req.uri().path();
 
-        // Check rate limit
-        if !self.global_request_limiter.try_acquire() || !self.request_manager.try_acquire(remote_addr.ip()) {
-            self.metrics.http_requests_rate_limited.fetch_add(1, Ordering::Relaxed);
+        // Basic path validation first (before rate limiting)
+        let valid_path = path == "/status"
+            || path == "/request"
+            || path.starts_with("/maintenance/");
+
+        if !valid_path {
+            debug!("Invalid HTTP path: {} from {}", path, remote_addr);
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::new()))
+                .unwrap());
+        }
+
+        // Check rate limit only for valid paths
+        if !self.request_manager.try_acquire(remote_addr.ip()) || !self.global_request_limiter.try_acquire() {
+            self.metrics.inc_http_rate_limited();
             debug!("Rate limit exceeded for IP: {}", remote_addr.ip());
             return Ok(Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
@@ -621,12 +903,12 @@ impl TunnelV2 {
             self.handle_game_request(req, &mappings).await
         } else {
             Response::builder()
-                .status(StatusCode::BAD_REQUEST)
+                .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::new()))
                 .unwrap()
         };
 
-        self.metrics.http_requests_processed.fetch_add(1, Ordering::Relaxed);
+        self.metrics.inc_http_processed();
         Ok(response)
     }
 
@@ -663,7 +945,7 @@ impl TunnelV2 {
             .unwrap()
     }
 
-    /// Handles game slot allocation requests
+    /// Handles game slot allocation requests using a proper query parser
     async fn handle_game_request(
         &self,
         req: Request<hyper::body::Incoming>,
@@ -676,14 +958,9 @@ impl TunnelV2 {
                 .unwrap();
         }
 
-        // Parse clients parameter
+        // Parse query parameters properly
         let query = req.uri().query().unwrap_or("");
-        let clients = query
-            .split('&')
-            .find(|p| p.starts_with("clients="))
-            .and_then(|p| p.split('=').nth(1))
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
+        let clients = Self::parse_clients_param(query);
 
         if clients < 2 || clients > 8 {
             return Response::builder()
@@ -693,7 +970,7 @@ impl TunnelV2 {
         }
 
         // Allocate client IDs
-        let client_ids = Self::allocate_client_ids(&mappings, clients, self.config.max_clients);
+        let client_ids = self.allocate_client_ids(&mappings, clients);
 
         if client_ids.len() < 2 {
             return Response::builder()
@@ -702,8 +979,8 @@ impl TunnelV2 {
                 .unwrap();
         }
 
-        self.metrics.game_slots_allocated.fetch_add(clients as u64, Ordering::Relaxed);
-        self.metrics.active_connections.fetch_add(clients, Ordering::Relaxed);
+        self.metrics.add_game_slots(clients as u64);
+        self.metrics.add_active_connections(clients);
 
         let response = format!(
             "[{}]",
@@ -722,45 +999,82 @@ impl TunnelV2 {
             .unwrap()
     }
 
-    /// Allocates client IDs for a game request
+    /// Parses the clients parameter from query string
+    fn parse_clients_param(query: &str) -> usize {
+        // Handle multiple clients= parameters by taking the last one
+        query
+            .split('&')
+            .filter_map(|param| {
+                let mut parts = param.splitn(2, '=');
+                match (parts.next(), parts.next()) {
+                    (Some("clients"), Some(value)) => value.parse::<usize>().ok(),
+                    _ => None,
+                }
+            })
+            .last()
+            .unwrap_or(0)
+    }
+
+    /// Allocates client IDs using the efficient allocator
     pub fn allocate_client_ids(
+        &self,
         mappings: &DashMap<i16, TunnelClient>,
         count: usize,
-        max_clients: usize,
     ) -> Vec<i16> {
-        if mappings.len() + count > max_clients {
-            return vec![];
-        }
-
         let mut client_ids = Vec::with_capacity(count);
-        let mut rng = rand::rng();
 
         for _ in 0..count {
-            let mut attempts = 0;
-            loop {
-                let id = rng.random::<i16>();
-                if id != 0 && !mappings.contains_key(&id) {
-                    let client = TunnelClient::new();
-                    client.update_last_receive();
-                    mappings.insert(id, client);
-                    client_ids.push(id);
-                    break;
-                }
+            let mut allocated = false;
 
-                attempts += 1;
-                if attempts > 100 {
-                    // Failed to find free ID, rollback
+            for _ in 0..MAX_ID_ALLOCATION_ATTEMPTS {
+                // Check capacity before attempting allocation
+                if mappings.len() >= self.config.max_clients {
+                    // Rollback all allocated IDs
                     for id in &client_ids {
                         mappings.remove(id);
+                        self.id_allocator.free(*id);
                     }
+                    warn!("Max clients reached during allocation");
                     return vec![];
                 }
+
+                if let Some(id) = self.id_allocator.allocate() {
+                    // Try to insert atomically
+                    let client = TunnelClient::new();
+                    client.update_last_receive();
+
+                    // Use entry API for atomic check-and-insert
+                    match mappings.entry(id) {
+                        dashmap::mapref::entry::Entry::Vacant(entry) => {
+                            entry.insert(client);
+                            client_ids.push(id);
+                            allocated = true;
+                            break;
+                        }
+                        dashmap::mapref::entry::Entry::Occupied(_) => {
+                            // ID already exists (shouldn't happen with allocator)
+                            warn!("Allocated ID {} already exists in mappings", id);
+                        }
+                    }
+                }
+            }
+
+            if !allocated {
+                // Failed to allocate, rollback
+                for id in &client_ids {
+                    mappings.remove(id);
+                    self.id_allocator.free(*id);
+                }
+                warn!("Failed to allocate ID after {} attempts", MAX_ID_ALLOCATION_ATTEMPTS);
+                return vec![];
             }
         }
+
+        debug!("Successfully allocated {} client IDs", client_ids.len());
         client_ids
     }
 
-    /// Sends heartbeat to master server and cleans up expired connections
+    /// Sends heartbeat to master server with better error handling
     async fn send_heartbeat(
         mappings: &DashMap<i16, TunnelClient>,
         maintenance_mode: &AtomicBool,
@@ -771,11 +1085,13 @@ impl TunnelV2 {
         max_clients: usize,
         master_password: &str,
         metrics: &ServiceMetrics,
+        id_allocator: &ClientIdAllocator,
     ) {
-        // Clean up expired mappings
+        // Clean up expired mappings and free their IDs
         let mut removed_count = 0;
-        mappings.retain(|_, client| {
+        mappings.retain(|id, client| {
             if client.is_timed_out() {
+                id_allocator.free(*id);
                 removed_count += 1;
                 false
             } else {
@@ -784,51 +1100,90 @@ impl TunnelV2 {
         });
 
         if removed_count > 0 {
-            metrics.active_connections.fetch_sub(removed_count, Ordering::Relaxed);
+            metrics.sub_active_connections(removed_count);
             debug!("Cleaned up {} timed out clients", removed_count);
         }
 
         let client_count = mappings.len();
         debug!("V2 Heartbeat: {} clients connected", client_count);
 
-        // Send to master server
+        // Send to master server if enabled
         if !no_master_announce {
+            // Get HTTP client
+            let client = match get_http_client() {
+                Some(c) => c,
+                None => {
+                    debug!("HTTP client not available, skipping heartbeat");
+                    return;
+                }
+            };
+
             let maintenance = if maintenance_mode.load(Ordering::Relaxed) {
                 "1"
             } else {
                 "0"
             };
 
+            // Build URL with validation - truncate name if needed
+            let mut truncated_name = name.to_string();
+            if truncated_name.len() > 100 {
+                truncated_name.truncate(100);
+                warn!("Server name truncated to 100 characters for master announcement");
+            }
+
+            let encoded_name = utf8_percent_encode(&truncated_name, NON_ALPHANUMERIC).to_string();
+            let encoded_password = utf8_percent_encode(master_password, NON_ALPHANUMERIC).to_string();
+
             let url = format!(
                 "{}?version=2&name={}&port={}&clients={}&maxclients={}&masterpw={}&maintenance={}",
                 master_url,
-                utf8_percent_encode(name, NON_ALPHANUMERIC),
+                encoded_name,
                 port,
                 client_count,
                 max_clients,
-                utf8_percent_encode(master_password, NON_ALPHANUMERIC),
+                encoded_password,
                 maintenance
             );
 
-            match HTTP_CLIENT.get(&url).send().await {
-                Ok(_) => debug!("V2 Heartbeat sent successfully"),
-                Err(e) => error!("V2 Heartbeat error: {}", e),
+            // Check URL length
+            if url.len() > MAX_URL_LENGTH {
+                error!("Master server URL too long ({} bytes), skipping heartbeat", url.len());
+                return;
+            }
+
+            // Send with timeout and error handling
+            let send_future = client.get(&url).send();
+            match timeout(Duration::from_secs(10), send_future).await {
+                Ok(Ok(response)) => {
+                    if response.status().is_success() {
+                        debug!("V2 Heartbeat sent successfully");
+                    } else {
+                        warn!("V2 Heartbeat failed with status: {}", response.status());
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!("V2 Heartbeat request error: {}", e);
+                }
+                Err(_) => {
+                    error!("V2 Heartbeat timeout after 10 seconds");
+                }
             }
         }
     }
 
     /// Gets current service metrics
     pub fn metrics(&self) -> V2Metrics {
+        let snapshot = self.metrics.snapshot();
         V2Metrics {
-            udp_packets_received: self.metrics.udp_packets_received.load(Ordering::Relaxed),
-            udp_packets_processed: self.metrics.udp_packets_processed.load(Ordering::Relaxed),
-            udp_packets_dropped: self.metrics.udp_packets_dropped.load(Ordering::Relaxed),
-            packets_tunneled: self.metrics.packets_tunneled.load(Ordering::Relaxed),
-            http_requests_received: self.metrics.http_requests_received.load(Ordering::Relaxed),
-            http_requests_processed: self.metrics.http_requests_processed.load(Ordering::Relaxed),
-            http_requests_rate_limited: self.metrics.http_requests_rate_limited.load(Ordering::Relaxed),
-            game_slots_allocated: self.metrics.game_slots_allocated.load(Ordering::Relaxed),
-            active_connections: self.metrics.active_connections.load(Ordering::Relaxed),
+            udp_packets_received: snapshot.udp_packets_received,
+            udp_packets_processed: snapshot.udp_packets_processed,
+            udp_packets_dropped: snapshot.udp_packets_dropped,
+            packets_tunneled: snapshot.packets_tunneled,
+            http_requests_received: snapshot.http_requests_received,
+            http_requests_processed: snapshot.http_requests_processed,
+            http_requests_rate_limited: snapshot.http_requests_rate_limited,
+            game_slots_allocated: snapshot.game_slots_allocated,
+            active_connections: snapshot.active_connections,
         }
     }
 }
@@ -894,17 +1249,46 @@ mod tests {
     }
 
     #[test]
+    fn test_client_id_allocator() {
+        let allocator = ClientIdAllocator::new();
+
+        // Allocate some IDs
+        let id1 = allocator.allocate().unwrap();
+        let id2 = allocator.allocate().unwrap();
+
+        assert_ne!(id1, 0);
+        assert_ne!(id2, 0);
+        assert_ne!(id1, id2);
+
+        // Free and reallocate
+        allocator.free(id1);
+        let id3 = allocator.allocate().unwrap();
+        assert_eq!(id3, id1); // Should reuse freed ID
+    }
+
+    #[test]
     fn test_allocate_client_ids() {
+        let service = TunnelV2::with_config(TunnelV2Config::default());
         let mappings = DashMap::new();
 
         // Normal allocation
-        let ids = TunnelV2::allocate_client_ids(&mappings, 4, 200);
+        let ids = service.allocate_client_ids(&mappings, 4);
         assert_eq!(ids.len(), 4);
         assert_eq!(mappings.len(), 4);
 
-        // Capacity limit
-        let ids = TunnelV2::allocate_client_ids(&mappings, 200, 200);
-        assert_eq!(ids.len(), 0);
-        assert_eq!(mappings.len(), 4); // Unchanged
+        // All IDs should be unique
+        let mut unique_ids = std::collections::HashSet::new();
+        for id in &ids {
+            assert!(unique_ids.insert(*id));
+        }
+    }
+
+    #[test]
+    fn test_parse_clients_param() {
+        assert_eq!(TunnelV2::parse_clients_param("clients=4"), 4);
+        assert_eq!(TunnelV2::parse_clients_param("other=1&clients=3"), 3);
+        assert_eq!(TunnelV2::parse_clients_param("clients=2&clients=5"), 5); // Last wins
+        assert_eq!(TunnelV2::parse_clients_param("clients=abc"), 0);
+        assert_eq!(TunnelV2::parse_clients_param(""), 0);
     }
 }

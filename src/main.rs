@@ -33,6 +33,21 @@ mod net;
 use config::Options;
 use net::{peer_to_peer::PeerToPeerService, tunnel_v2::TunnelV2, tunnel_v3::TunnelV3};
 
+/// Service startup result tracking
+#[derive(Debug)]
+struct ServiceStartupResult {
+    /// Service name
+    name: &'static str,
+    /// Whether the service is critical (server cannot run without it)
+    critical: bool,
+    /// Whether the service started successfully
+    success: bool,
+    /// Shutdown sender if started successfully
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Task handle if started successfully
+    handle: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
 /// Main entry point
 ///
 /// Initializes logging, parses configuration, and starts all services
@@ -61,8 +76,24 @@ async fn main() -> Result<()> {
     // Display configuration summary
     print_configuration(&options);
 
+    // Check system socket buffer limits
+    net::utils::log_socket_limits();
+
     // Start all services and collect shutdown senders and handles
-    let (shutdown_txs, handles) = start_services(options).await?;
+    let services = start_services(options).await?;
+
+    // Extract running services
+    let mut shutdown_txs: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
+
+    for service in services {
+        if service.success {
+            if let (Some(tx), Some(handle)) = (service.shutdown_tx, service.handle) {
+                shutdown_txs.push(tx);
+                handles.push(handle);
+            }
+        }
+    }
 
     // Wait for shutdown signal
     wait_for_shutdown().await;
@@ -70,27 +101,35 @@ async fn main() -> Result<()> {
     info!("CnCNet server shutting down gracefully");
 
     // Send shutdown to all services
-    for tx in shutdown_txs {
+    for tx in shutdown_txs.drain(..) {
         match tx.send(()) {
             Err(_) => {
-                warn!("Service shutdown channel already closed, service may not have started");
+                warn!("Service shutdown channel already closed");
             }
-            Ok(..) => {
+            Ok(()) => {
                 info!("Shutdown signal sent to service");
             }
         }
     }
 
-    // Wait for all services to complete
-    for handle in handles {
-        match handle.await {
-            Ok(result) => {
-                if let Err(e) = result {
-                    error!("Service error during shutdown: {}", e);
+    // Wait for all services to complete with timeout
+    let shutdown_timeout = tokio::time::Duration::from_secs(10);
+    let shutdown_future = async {
+        for handle in handles.drain(..) {
+            match handle.await {
+                Ok(result) => {
+                    if let Err(e) = result {
+                        error!("Service error during shutdown: {}", e);
+                    }
                 }
+                Err(e) => error!("Service panicked during shutdown: {}", e),
             }
-            Err(e) => error!("Service panicked during shutdown: {}", e),
         }
+    };
+
+    match tokio::time::timeout(shutdown_timeout, shutdown_future).await {
+        Ok(_) => info!("All services shut down successfully"),
+        Err(_) => error!("Some services did not shut down within timeout"),
     }
 
     Ok(())
@@ -145,36 +184,68 @@ fn print_configuration(options: &Options) {
 
 /// Starts all server services
 ///
-/// Returns a vector of shutdown senders and a vector of join handles for graceful shutdown.
-async fn start_services(
-    options: Options,
-) -> Result<(
-    Vec<tokio::sync::oneshot::Sender<()>>,
-    Vec<tokio::task::JoinHandle<Result<()>>>,
-)> {
-    let mut shutdown_txs = Vec::new();
-    let mut handles = Vec::new();
+/// Returns a vector of service startup results for analysis
+async fn start_services(options: Options) -> Result<Vec<ServiceStartupResult>> {
+    let mut services = Vec::new();
 
-    // Start P2P NAT traversal services if enabled
+    // Start P2P NAT traversal services if enabled (OPTIONAL)
     if !options.nop2p {
         info!("Starting P2P NAT traversal services");
 
         // STUN on port 8054
-        let service_8054 = PeerToPeerService::new(8054);
-        let (tx, handle) = service_8054.start().await?;
-        shutdown_txs.push(tx);
-        handles.push(handle);
+        let result = match PeerToPeerService::new(8054).start().await {
+            Ok((tx, handle)) => {
+                info!("P2P service started on port 8054");
+                ServiceStartupResult {
+                    name: "P2P 8054",
+                    critical: false,
+                    success: true,
+                    shutdown_tx: Some(tx),
+                    handle: Some(handle),
+                }
+            }
+            Err(e) => {
+                error!("Failed to start P2P service on port 8054: {}", e);
+                ServiceStartupResult {
+                    name: "P2P 8054",
+                    critical: false,
+                    success: false,
+                    shutdown_tx: None,
+                    handle: None,
+                }
+            }
+        };
+        services.push(result);
 
         // STUN on port 3478 (standard STUN port)
-        let service_3478 = PeerToPeerService::new(3478);
-        let (tx, handle) = service_3478.start().await?;
-        shutdown_txs.push(tx);
-        handles.push(handle);
+        let result = match PeerToPeerService::new(3478).start().await {
+            Ok((tx, handle)) => {
+                info!("P2P service started on port 3478");
+                ServiceStartupResult {
+                    name: "P2P 3478",
+                    critical: false,
+                    success: true,
+                    shutdown_tx: Some(tx),
+                    handle: Some(handle),
+                }
+            }
+            Err(e) => {
+                error!("Failed to start P2P service on port 3478: {}", e);
+                ServiceStartupResult {
+                    name: "P2P 3478",
+                    critical: false,
+                    success: false,
+                    shutdown_tx: None,
+                    handle: None,
+                }
+            }
+        };
+        services.push(result);
     } else {
         info!("P2P NAT traversal disabled");
     }
 
-    // Start Tunnel V3
+    // Start Tunnel V3 (CRITICAL)
     info!("Starting Tunnel V3 on port {}", options.port);
     let tunnel_v3 = TunnelV3::new(
         options.port,
@@ -186,11 +257,32 @@ async fn start_services(
         options.master.clone(),
         options.iplimit,
     );
-    let (tx, handle) = tunnel_v3.start().await?;
-    shutdown_txs.push(tx);
-    handles.push(handle);
 
-    // Start Tunnel V2
+    let result = match tunnel_v3.start().await {
+        Ok((tx, handle)) => {
+            info!("Tunnel V3 started successfully");
+            ServiceStartupResult {
+                name: "Tunnel V3",
+                critical: true,
+                success: true,
+                shutdown_tx: Some(tx),
+                handle: Some(handle),
+            }
+        }
+        Err(e) => {
+            error!("Failed to start Tunnel V3: {}", e);
+            ServiceStartupResult {
+                name: "Tunnel V3",
+                critical: true,
+                success: false,
+                shutdown_tx: None,
+                handle: None,
+            }
+        }
+    };
+    services.push(result);
+
+    // Start Tunnel V2 (CRITICAL)
     info!("Starting Tunnel V2 on port {} (UDP + HTTP)", options.portv2);
     let tunnel_v2 = TunnelV2::new(
         options.portv2,
@@ -202,11 +294,77 @@ async fn start_services(
         options.master,
         options.iplimitv2,
     );
-    let (tx, handle) = Arc::new(tunnel_v2).start().await?;
-    shutdown_txs.push(tx);
-    handles.push(handle);
 
-    Ok((shutdown_txs, handles))
+    let result = match Arc::new(tunnel_v2).start().await {
+        Ok((tx, handle)) => {
+            info!("Tunnel V2 started successfully");
+            ServiceStartupResult {
+                name: "Tunnel V2",
+                critical: true,
+                success: true,
+                shutdown_tx: Some(tx),
+                handle: Some(handle),
+            }
+        }
+        Err(e) => {
+            error!("Failed to start Tunnel V2: {}", e);
+            ServiceStartupResult {
+                name: "Tunnel V2",
+                critical: true,
+                success: false,
+                shutdown_tx: None,
+                handle: None,
+            }
+        }
+    };
+    services.push(result);
+
+    // Check if any critical services failed
+    let critical_failures: Vec<&str> = services
+        .iter()
+        .filter(|s| s.critical && !s.success)
+        .map(|s| s.name)
+        .collect();
+
+    if !critical_failures.is_empty() {
+        error!("Critical services failed to start: {:?}", critical_failures);
+
+        // Log optional service status
+        let optional_status: Vec<(&str, bool)> = services
+            .iter()
+            .filter(|s| !s.critical)
+            .map(|s| (s.name, s.success))
+            .collect();
+
+        if !optional_status.is_empty() {
+            info!("Optional service status: {:?}", optional_status);
+        }
+
+        // Shut down all started services
+        error!("Shutting down all started services due to critical failures");
+        for mut service in services.drain(..) {
+            if let (Some(tx), Some(handle)) = (service.shutdown_tx.take(), service.handle.take()) {
+                let _ = tx.send(());
+                let _ = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(2),
+                    handle,
+                ).await;
+            }
+        }
+
+        anyhow::bail!("Failed to start critical services: {:?}", critical_failures);
+    }
+
+    // Log service summary
+    let running_services: Vec<&str> = services
+        .iter()
+        .filter(|s| s.success)
+        .map(|s| s.name)
+        .collect();
+
+    info!("Successfully started services: {:?}", running_services);
+
+    Ok(services)
 }
 
 /// Waits for shutdown signal (Ctrl+C or SIGTERM)
@@ -217,10 +375,53 @@ async fn wait_for_shutdown() {
     {
         use tokio::signal::unix::{signal, SignalKind};
 
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
-        let mut sigint =
-            signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(sig) => sig,
+            Err(e) => {
+                error!("Failed to register SIGTERM handler: {}", e);
+                // Fall back to just Ctrl+C
+                signal::ctrl_c()
+                    .await
+                    .expect("Failed to register Ctrl+C handler");
+                info!("Received Ctrl+C");
+                return;
+            }
+        };
+
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(sig) => sig,
+            Err(e) => {
+                error!("Failed to register SIGINT handler: {}", e);
+                // Fall back to just Ctrl+C
+                signal::ctrl_c()
+                    .await
+                    .expect("Failed to register Ctrl+C handler");
+                info!("Received Ctrl+C");
+                return;
+            }
+        };
+
+        // Also handle SIGHUP for completeness
+        // let mut sighup = match signal(SignalKind::hangup()) {
+        //     Ok(sig) => sig,
+        //     Err(e) => {
+        //         warn!("Failed to register SIGHUP handler: {}", e);
+        //         // SIGHUP is optional, continue without it
+        //         // Create a never-completing future as placeholder
+        //         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        //         std::mem::forget(tx); // Ensure it never sends
+        //         rx
+        //     }
+        // };
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(sig) => sig,
+            Err(e) => {
+                warn!("Failed to register SIGHUP handler: {}", e);
+                // SIGHUP is optional, continue without it
+                return;
+            }
+        };
+
 
         tokio::select! {
             _ = sigterm.recv() => {
@@ -228,6 +429,9 @@ async fn wait_for_shutdown() {
             }
             _ = sigint.recv() => {
                 info!("Received SIGINT (Ctrl+C)");
+            }
+            _ = sighup.recv() => {
+                info!("Received SIGHUP");
             }
             _ = signal::ctrl_c() => {
                 info!("Received Ctrl+C");
@@ -269,5 +473,20 @@ mod tests {
         assert_eq!(opts.port, 50001);
         assert_eq!(opts.name, "Test Server");
         assert_eq!(opts.maxclients, 100);
+    }
+
+    #[test]
+    fn test_service_startup_result() {
+        let result = ServiceStartupResult {
+            name: "Test Service",
+            critical: true,
+            success: false,
+            shutdown_tx: None,
+            handle: None,
+        };
+
+        assert_eq!(result.name, "Test Service");
+        assert!(result.critical);
+        assert!(!result.success);
     }
 }

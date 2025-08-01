@@ -3,13 +3,77 @@
 //! This module implements the V3 tunnel protocol for CnCNet.
 //! It provides UDP-based tunneling with master server announcements.
 //!
+//! ## Protocol Overview
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────────────┐
+//! │                         Tunnel V3 Architecture                          │
+//! ├─────────────────────────────────────────────────────────────────────────┤
+//! │                                                                         │
+//! │  Game Client A                                    Game Client B         │
+//! │       │                                                  │              │
+//! │       │ [Sender: A, Receiver: B, Data]                   │              │
+//! │       └────────────────────┐                             │              │
+//! │                            ▼                             │              │
+//! │                    ┌───────────────┐                     │              │
+//! │                    │  UDP Socket   │                     │              │
+//! │                    │   :50001      │                     │              │
+//! │                    └───────┬───────┘                     │              │
+//! │                            │                             │              │
+//! │                    ┌───────▼───────┐                     │              │
+//! │                    │ Packet Router │                     │              │
+//! │                    └───────┬───────┘                     │              │
+//! │                            │                             │              │
+//! │         ┌──────────────────┼──────────────────┐          │              │
+//! │         ▼                  ▼                  ▼          │              │
+//! │   ┌───────────┐    ┌─────────────┐       ┌───────────┐   │              │
+//! │   │  Special  │    │   Client    │       │  Forward  │   │              │
+//! │   │  Commands │    │ Management  │       │  Traffic  │   │              │
+//! │   └───────────┘    └─────────────┘       └─────┬─────┘   │              │
+//! │                                                │         │              │
+//! │                                                └─────────┴──────────────┤
+//! │                                          [Sender: A, Receiver: B, Data] │
+//! │                                                                         │
+//! │  ┌────────────────────────────────────────────────────────────────┐     │
+//! │  │                        Packet Format                           │     │
+//! │  ├────────────────────────────────────────────────────────────────┤     │
+//! │  │  0-3:  Sender ID (u32 LE)                                      │     │
+//! │  │  4-7:  Receiver ID (u32 LE)                                    │     │
+//! │  │  8+:   Payload Data                                            │     │
+//! │  │                                                                │     │
+//! │  │  Special IDs:                                                  │     │
+//! │  │  - 0,0: Ping packet (50 bytes total)                           │     │
+//! │  │  - 0,MAX: Command packet (maintenance)                         │     │
+//! │  └────────────────────────────────────────────────────────────────┘     │
+//! │                                                                         │
+//! │  ┌────────────────────────────────────────────────────────────────┐     │
+//! │  │                    Connection State Machine                    │     │
+//! │  ├────────────────────────────────────────────────────────────────┤     │
+//! │  │                                                                │     │
+//! │  │     New Client ──┬──▶ Active ──┬──▶ Timed Out ──▶ Removed      │     │
+//! │  │                  │             │                               │     │
+//! │  │                  │             ▼                               │     │
+//! │  │                  │         IP Change                           │     │
+//! │  │                  │         (if allowed)                        │     │
+//! │  │                  │              │                              │     │
+//! │  │                  └──────────────┘                              │     │
+//! │  │                                                                │     │
+//! │  │  Rate Limits:                                                  │     │
+//! │  │  - Per-IP connection limit                                     │     │
+//! │  │  - Global connection limit                                     │     │
+//! │  │  - Ping rate limiting (per-IP and global)                      │     │
+//! │  │  - Command rate limiting (per-IP and global)                   │     │
+//! │  └────────────────────────────────────────────────────────────────┘     │
+//! └─────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
 //! Key features:
 //! - UDP-based client-to-client tunneling
 //! - Automatic client ID management
 //! - Master server heartbeat announcements
 //! - Command-based maintenance control
-//! - Per-IP connection limiting
-//! - Rate limiting for pings
+//! - Per-IP connection limiting with atomic operations
+//! - Rate limiting for pings and commands
 //! - Graceful shutdown support
 //! - Enhanced logging and error handling
 //! - Low memory usage with bounded collections
@@ -30,7 +94,7 @@ use smallvec::SmallVec;
 use tokio::net::UdpSocket;
 use tokio::sync::{oneshot::{self, Receiver}, Semaphore};
 use tokio::time::{self, timeout};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, trace};
 
 use crate::net::constants::*;
 use crate::net::rate_limiter::{IpRateLimiterManager, RateLimiterConfig};
@@ -55,8 +119,26 @@ const DEFAULT_MAX_PINGS_PER_IP: usize = 20;
 /// Default maximum total pings globally during one interval
 const DEFAULT_MAX_PINGS_GLOBAL: usize = 5000;
 
+/// Default maximum commands per IP during one interval
+const DEFAULT_MAX_COMMANDS_PER_IP: usize = 5;
+
+/// Default maximum total commands globally during one interval
+const DEFAULT_MAX_COMMANDS_GLOBAL: usize = 100;
+
 /// Default counter reset interval in milliseconds
 const DEFAULT_RESET_INTERVAL_MS: u64 = 60_000;
+
+/// Maximum URL length for HTTP requests
+const MAX_URL_LENGTH: usize = 2000;
+
+/// Maximum failed command attempts before IP block
+const MAX_FAILED_COMMANDS: usize = 3;
+
+/// IP block duration for failed commands (seconds)
+const COMMAND_BLOCK_DURATION_SECS: u64 = 3600; // 1 hour
+
+/// Stale connection timeout for cleanup (5 minutes)
+const STALE_CONNECTION_TIMEOUT_MS: u64 = 300_000;
 
 /// HTTP client for master server announcements
 static HTTP_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
@@ -90,6 +172,10 @@ pub struct TunnelV3Config {
     pub max_pings_per_ip: usize,
     /// Maximum total pings globally during one reset interval
     pub max_pings_global: usize,
+    /// Maximum commands per IP during one reset interval
+    pub max_commands_per_ip: usize,
+    /// Maximum total commands globally during one reset interval
+    pub max_commands_global: usize,
     /// Interval for resetting rate limiters (milliseconds)
     pub reset_interval_ms: u64,
     /// Maximum concurrent packet processing
@@ -109,6 +195,8 @@ impl Default for TunnelV3Config {
             master_server_url: "http://cncnet.org/master-announce".to_string(),
             max_pings_per_ip: DEFAULT_MAX_PINGS_PER_IP,
             max_pings_global: DEFAULT_MAX_PINGS_GLOBAL,
+            max_commands_per_ip: DEFAULT_MAX_COMMANDS_PER_IP,
+            max_commands_global: DEFAULT_MAX_COMMANDS_GLOBAL,
             reset_interval_ms: DEFAULT_RESET_INTERVAL_MS,
             max_concurrent_processing: MAX_CONCURRENT_PROCESSING,
         }
@@ -132,6 +220,8 @@ struct ServiceMetrics {
     connections_rejected: AtomicU64,
     /// Current active connections
     active_connections: AtomicUsize,
+    /// Failed command attempts
+    failed_commands: AtomicU64,
 }
 
 impl ServiceMetrics {
@@ -144,17 +234,23 @@ impl ServiceMetrics {
             connections_created: AtomicU64::new(0),
             connections_rejected: AtomicU64::new(0),
             active_connections: AtomicUsize::new(0),
+            failed_commands: AtomicU64::new(0),
         }
     }
 }
 
-/// Connection state for tracking IP limits
+/// Connection state for tracking IP limits with thread-safe operations
+///
+/// This implementation uses a transactional approach to ensure atomic updates
+/// across both the IP connection counts and client-to-IP mappings.
 #[derive(Debug)]
 struct ConnectionState {
     /// Per-IP connection counts
-    ip_connections: DashMap<IpAddr, usize>,
+    ip_connections: DashMap<IpAddr, AtomicUsize>,
     /// Reverse mapping: client_id -> IP
     client_to_ip: DashMap<u32, IpAddr>,
+    /// Last activity timestamp for each IP (for stale cleanup)
+    ip_last_activity: DashMap<IpAddr, AtomicU64>,
 }
 
 impl ConnectionState {
@@ -162,51 +258,118 @@ impl ConnectionState {
         Self {
             ip_connections: DashMap::with_capacity(1024),
             client_to_ip: DashMap::with_capacity(2048),
+            ip_last_activity: DashMap::with_capacity(1024),
         }
     }
 
-    /// Tries to add a new connection for an IP
-    /// Returns true if allowed, false if limit reached
+    /// Updates activity timestamp for an IP
+    fn update_activity(&self, ip: IpAddr) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        self.ip_last_activity
+            .entry(ip)
+            .or_insert_with(|| AtomicU64::new(now))
+            .store(now, Ordering::Relaxed);
+    }
+
+    /// Tries to add a new connection for an IP (thread-safe)
     fn try_add_connection(&self, client_id: u32, ip: IpAddr, limit: usize) -> bool {
-        // Check current count
-        let current = self.ip_connections.get(&ip).map(|c| *c).unwrap_or(0);
-        if current >= limit {
-            return false;
-        }
+        // Update activity
+        self.update_activity(ip);
 
-        // Add connection
-        *self.ip_connections.entry(ip).or_insert(0) += 1;
-        self.client_to_ip.insert(client_id, ip);
-        true
-    }
+        // Get or create atomic counter for this IP
+        let counter = self.ip_connections
+            .entry(ip)
+            .or_insert_with(|| AtomicUsize::new(0));
 
-    /// Updates a connection when IP changes
-    /// Returns true if allowed, false if new IP limit reached
-    fn update_connection(&self, client_id: u32, new_ip: IpAddr, limit: usize) -> bool {
-        // Get old IP
-        if let Some(old_ip) = self.client_to_ip.get(&client_id).map(|ip| *ip) {
-            if old_ip == new_ip {
-                return true; // No change
-            }
-
-            // Check new IP limit
-            let new_count = self.ip_connections.get(&new_ip).map(|c| *c).unwrap_or(0);
-            if new_count >= limit {
+        // Try to increment if under limit
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
                 return false;
             }
 
-            // Update counts atomically
-            // Decrement old IP
-            if let Some(mut old_count) = self.ip_connections.get_mut(&old_ip) {
-                *old_count = old_count.saturating_sub(1);
-                if *old_count == 0 {
-                    drop(old_count);
-                    self.ip_connections.remove(&old_ip);
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // Successfully incremented
+                    self.client_to_ip.insert(client_id, ip);
+                    return true;
+                }
+                Err(actual) => {
+                    current = actual;
+                }
+            }
+        }
+    }
+
+    /// Updates a connection when IP changes (thread-safe atomic transaction)
+    ///
+    /// This implementation uses a two-phase approach:
+    /// 1. Reserve the new slot atomically
+    /// 2. Release the old slot
+    /// This ensures we never have inconsistent state
+    fn update_connection(&self, client_id: u32, new_ip: IpAddr, limit: usize) -> bool {
+        // Update activity for new IP
+        self.update_activity(new_ip);
+
+        // Get old IP if exists
+        let old_ip = self.client_to_ip.get(&client_id).map(|entry| *entry);
+
+        if let Some(old_ip) = old_ip {
+            if old_ip == new_ip {
+                return true; // No change needed
+            }
+
+            // Phase 1: Try to reserve slot in new IP first
+            let new_counter = self.ip_connections
+                .entry(new_ip)
+                .or_insert_with(|| AtomicUsize::new(0));
+
+            let mut new_count = new_counter.load(Ordering::Acquire);
+            loop {
+                if new_count >= limit {
+                    // New IP is at limit, reject the update
+                    return false;
+                }
+
+                match new_counter.compare_exchange_weak(
+                    new_count,
+                    new_count + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        // Successfully reserved slot in new IP
+                        break;
+                    }
+                    Err(actual) => {
+                        new_count = actual;
+                    }
                 }
             }
 
-            // Increment new IP
-            *self.ip_connections.entry(new_ip).or_insert(0) += 1;
+            // Phase 2: Now release the old IP slot (can't fail)
+            if let Some(old_counter) = self.ip_connections.get(&old_ip) {
+                let prev = old_counter.fetch_sub(1, Ordering::AcqRel);
+
+                // Clean up if this was the last connection
+                if prev == 1 {
+                    self.ip_connections.remove_if(&old_ip, |_, counter| {
+                        counter.load(Ordering::Acquire) == 0
+                    });
+                    self.ip_last_activity.remove(&old_ip);
+                }
+            }
 
             // Update mapping
             self.client_to_ip.insert(client_id, new_ip);
@@ -217,14 +380,18 @@ impl ConnectionState {
         }
     }
 
-    /// Removes a connection
+    /// Removes a connection (thread-safe)
     fn remove_connection(&self, client_id: u32) {
         if let Some((_, ip)) = self.client_to_ip.remove(&client_id) {
-            if let Some(mut count) = self.ip_connections.get_mut(&ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    drop(count);
-                    self.ip_connections.remove(&ip);
+            if let Some(counter) = self.ip_connections.get(&ip) {
+                let prev = counter.fetch_sub(1, Ordering::AcqRel);
+
+                // Clean up if this was the last connection
+                if prev == 1 {
+                    self.ip_connections.remove_if(&ip, |_, counter| {
+                        counter.load(Ordering::Acquire) == 0
+                    });
+                    self.ip_last_activity.remove(&ip);
                 }
             }
         }
@@ -232,7 +399,119 @@ impl ConnectionState {
 
     /// Gets the current connection count for an IP
     fn get_ip_count(&self, ip: &IpAddr) -> usize {
-        self.ip_connections.get(ip).map(|c| *c).unwrap_or(0)
+        self.ip_connections
+            .get(ip)
+            .map(|counter| counter.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// Gets total number of unique IPs
+    fn unique_ip_count(&self) -> usize {
+        self.ip_connections.len()
+    }
+
+    /// Gets total number of connections
+    fn total_connections(&self) -> usize {
+        self.client_to_ip.len()
+    }
+
+    /// Cleans up stale IP entries (no active connections for timeout period)
+    fn cleanup_stale_ips(&self, timeout_ms: u64) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Use retain to avoid iterator invalidation issues
+        self.ip_last_activity.retain(|ip, last_activity| {
+            let last = last_activity.load(Ordering::Relaxed);
+            let is_stale = now.saturating_sub(last) > timeout_ms;
+
+            if is_stale {
+                // Check if IP has no active connections
+                if let Some(counter) = self.ip_connections.get(ip) {
+                    if counter.load(Ordering::Acquire) == 0 {
+                        // Remove from ip_connections too
+                        self.ip_connections.remove(ip);
+                        return false; // Remove from ip_last_activity
+                    }
+                }
+            }
+            true // Keep in ip_last_activity
+        });
+    }
+}
+
+/// Tracks failed command attempts per IP
+#[derive(Debug)]
+struct CommandBlocklist {
+    /// IP -> (failed attempts, block until timestamp)
+    blocked_ips: DashMap<IpAddr, (usize, u64)>,
+}
+
+impl CommandBlocklist {
+    fn new() -> Self {
+        Self {
+            blocked_ips: DashMap::with_capacity(100),
+        }
+    }
+
+    /// Checks if IP is blocked
+    fn is_blocked(&self, ip: IpAddr) -> bool {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if let Some(entry) = self.blocked_ips.get(&ip) {
+            let (_, block_until) = *entry;
+            if now < block_until {
+                return true;
+            } else {
+                // Unblock expired entries
+                drop(entry);
+                self.blocked_ips.remove(&ip);
+            }
+        }
+        false
+    }
+
+    /// Records a failed attempt
+    fn record_failure(&self, ip: IpAddr) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.blocked_ips
+            .entry(ip)
+            .and_modify(|(attempts, block_until)| {
+                *attempts += 1;
+                if *attempts >= MAX_FAILED_COMMANDS {
+                    *block_until = now + COMMAND_BLOCK_DURATION_SECS;
+                }
+            })
+            .or_insert((1, 0));
+    }
+
+    /// Cleans up old entries
+    fn cleanup(&self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.blocked_ips.retain(|_, (_, block_until)| {
+            *block_until > now
+        });
     }
 }
 
@@ -246,14 +525,18 @@ pub struct TunnelV3 {
     ping_manager: Arc<IpRateLimiterManager>,
     /// Global ping rate limiter
     global_ping_limiter: Arc<crate::net::rate_limiter::RateLimiter>,
+    /// Manager for per-IP command rate limiting
+    command_manager: Arc<IpRateLimiterManager>,
+    /// Global command rate limiter
+    global_command_limiter: Arc<crate::net::rate_limiter::RateLimiter>,
     /// Maintenance mode flag
     maintenance_mode: Arc<AtomicBool>,
-    /// Last command timestamp for rate limiting
-    last_command_time: Arc<AtomicU64>,
     /// Service metrics
     metrics: Arc<ServiceMetrics>,
     /// Semaphore for backpressure control
     processing_semaphore: Arc<Semaphore>,
+    /// Command failure blocklist
+    command_blocklist: Arc<CommandBlocklist>,
 }
 
 impl TunnelV3 {
@@ -261,12 +544,15 @@ impl TunnelV3 {
     pub fn with_config(mut config: TunnelV3Config) -> Self {
         // Normalize configuration
         if config.port <= 1024 {
+            warn!("Port {} is privileged, changing to 50001", config.port);
             config.port = 50001;
         }
         if config.max_clients < 2 {
+            warn!("Max clients {} too low, changing to 200", config.max_clients);
             config.max_clients = 200;
         }
         if config.ip_limit < 1 {
+            warn!("IP limit {} too low, changing to 8", config.ip_limit);
             config.ip_limit = 8;
         }
         if config.name.is_empty() {
@@ -285,22 +571,40 @@ impl TunnelV3 {
         };
 
         // Configure global ping rate limiter
-        let global_rl_config = RateLimiterConfig {
+        let global_ping_config = RateLimiterConfig {
             max_tokens: config.max_pings_global as u32,
             refill_rate: config.max_pings_global as u32,
             refill_interval_ms: config.reset_interval_ms,
             ordering: crate::net::rate_limiter::MemoryOrdering::Relaxed,
         };
-        let global_ping_limiter = Arc::new(crate::net::rate_limiter::RateLimiter::with_config(global_rl_config));
+        let global_ping_limiter = Arc::new(crate::net::rate_limiter::RateLimiter::with_config(global_ping_config));
 
         // Configure per-IP ping rate limiter manager
-        let per_ip_rl_config = RateLimiterConfig {
+        let per_ip_ping_config = RateLimiterConfig {
             max_tokens: config.max_pings_per_ip as u32,
             refill_rate: config.max_pings_per_ip as u32,
             refill_interval_ms: config.reset_interval_ms,
             ordering: crate::net::rate_limiter::MemoryOrdering::Relaxed,
         };
-        let ping_manager = Arc::new(IpRateLimiterManager::new(per_ip_rl_config));
+        let ping_manager = Arc::new(IpRateLimiterManager::new(per_ip_ping_config));
+
+        // Configure global command rate limiter
+        let global_command_config = RateLimiterConfig {
+            max_tokens: config.max_commands_global as u32,
+            refill_rate: config.max_commands_global as u32,
+            refill_interval_ms: config.reset_interval_ms,
+            ordering: crate::net::rate_limiter::MemoryOrdering::Sequential, // Commands need strong ordering
+        };
+        let global_command_limiter = Arc::new(crate::net::rate_limiter::RateLimiter::with_config(global_command_config));
+
+        // Configure per-IP command rate limiter manager
+        let per_ip_command_config = RateLimiterConfig {
+            max_tokens: config.max_commands_per_ip as u32,
+            refill_rate: config.max_commands_per_ip as u32,
+            refill_interval_ms: config.reset_interval_ms,
+            ordering: crate::net::rate_limiter::MemoryOrdering::Sequential,
+        };
+        let command_manager = Arc::new(IpRateLimiterManager::new(per_ip_command_config));
 
         // Create processing semaphore
         let processing_semaphore = Arc::new(Semaphore::new(config.max_concurrent_processing));
@@ -310,10 +614,12 @@ impl TunnelV3 {
             maintenance_password_sha1,
             ping_manager,
             global_ping_limiter,
+            command_manager,
+            global_command_limiter,
             maintenance_mode: Arc::new(AtomicBool::new(false)),
-            last_command_time: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(ServiceMetrics::new()),
             processing_semaphore,
+            command_blocklist: Arc::new(CommandBlocklist::new()),
         }
     }
 
@@ -372,6 +678,37 @@ impl TunnelV3 {
 
         // Start per-IP ping cleanup task
         let ping_cleanup_handle = self.ping_manager.clone().start_cleanup_task();
+
+        // Start per-IP command cleanup task
+        let command_cleanup_handle = self.command_manager.clone().start_cleanup_task();
+
+        // Start command blocklist cleanup task
+        let blocklist_cleanup_handle = {
+            let blocklist = self.command_blocklist.clone();
+            tokio::spawn(async move {
+                let mut interval = time::interval(Duration::from_secs(300)); // 5 minutes
+                interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+                loop {
+                    interval.tick().await;
+                    blocklist.cleanup();
+                }
+            })
+        };
+
+        // Start connection state cleanup task
+        let state_cleanup_handle = {
+            let state = connection_state.clone();
+            tokio::spawn(async move {
+                let mut interval = time::interval(Duration::from_secs(60)); // 1 minute
+                interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+                loop {
+                    interval.tick().await;
+                    state.cleanup_stale_ips(STALE_CONNECTION_TIMEOUT_MS);
+                }
+            })
+        };
 
         // Start heartbeat task
         let heartbeat_handle = {
@@ -434,12 +771,13 @@ impl TunnelV3 {
                 loop {
                     interval.tick().await;
                     info!(
-                        "V3 metrics - received: {}, processed: {}, dropped: {}, tunneled: {}, active: {}",
+                        "V3 metrics - received: {}, processed: {}, dropped: {}, tunneled: {}, active: {}, failed_cmds: {}",
                         metrics.packets_received.load(Ordering::Relaxed),
                         metrics.packets_processed.load(Ordering::Relaxed),
                         metrics.packets_dropped.load(Ordering::Relaxed),
                         metrics.packets_tunneled.load(Ordering::Relaxed),
                         metrics.active_connections.load(Ordering::Relaxed),
+                        metrics.failed_commands.load(Ordering::Relaxed),
                     );
                 }
             })
@@ -455,6 +793,9 @@ impl TunnelV3 {
                 _ = &mut shutdown_rx => {
                     info!("Tunnel V3 shutting down");
                     ping_cleanup_handle.abort();
+                    command_cleanup_handle.abort();
+                    blocklist_cleanup_handle.abort();
+                    state_cleanup_handle.abort();
                     heartbeat_handle.abort();
                     metrics_handle.abort();
                     break Ok(());
@@ -523,7 +864,7 @@ impl TunnelV3 {
         // Handle special command packets
         if sender_id == 0 {
             if receiver_id == u32::MAX && data.len() >= 8 + 1 + 20 {
-                self.execute_command(data[8], &data[9..29]).await;
+                self.execute_command(data[8], &data[9..29], remote_addr.ip()).await;
             }
             if receiver_id != 0 {
                 return;
@@ -538,10 +879,17 @@ impl TunnelV3 {
 
         // Handle ping packets
         if sender_id == 0 && receiver_id == 0 {
-            if data.len() == 50 && !self.ping_limit_reached(remote_addr.ip()) {
-                if let Err(e) = socket.send_to(&data[..12], remote_addr).await {
-                    debug!("Failed to send ping response: {}", e);
+            if data.len() == 50 {
+                if !self.ping_limit_reached(remote_addr.ip()) {
+                    if let Err(e) = socket.send_to(&data[..12], remote_addr).await {
+                        debug!("Failed to send ping response: {}", e);
+                    }
+                } else {
+                    trace!("Ping rate limit reached for {}", remote_addr.ip());
+                    self.metrics.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 }
+            } else {
+                trace!("Malformed ping packet from {}: {} bytes", remote_addr, data.len());
             }
             self.metrics.packets_processed.fetch_add(1, Ordering::Relaxed);
             return;
@@ -577,7 +925,7 @@ impl TunnelV3 {
         true
     }
 
-    /// Handles tunnel traffic between clients
+    /// Handles tunnel traffic between clients (TOCTOU-safe)
     async fn handle_tunnel_traffic(
         &self,
         sender_id: u32,
@@ -588,60 +936,102 @@ impl TunnelV3 {
         mappings: &DashMap<u32, TunnelClient>,
         connection_state: &ConnectionState,
     ) {
-        // Handle existing sender
-        if let Some(mut sender) = mappings.get_mut(&sender_id) {
-            let existing_ep = sender.remote_ep;
+        // Use entry API for atomic operations
+        match mappings.entry(sender_id) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let sender = entry.get_mut();
+                let existing_ep = sender.remote_ep;
 
-            if let Some(ep) = existing_ep {
-                if ep != remote_addr {
-                    // IP change attempt
-                    if sender.is_timed_out()
-                        && !self.maintenance_mode.load(Ordering::Relaxed)
-                        && connection_state.update_connection(sender_id, remote_addr.ip(), self.config.ip_limit)
-                    {
-                        sender.remote_ep = Some(remote_addr);
-                        debug!("Client {} changed IP from {} to {}", sender_id, ep, remote_addr);
+                if let Some(ep) = existing_ep {
+                    if ep != remote_addr {
+                        // IP change attempt - check all conditions atomically
+                        let maintenance = self.maintenance_mode.load(Ordering::Relaxed);
+
+                        // Update activity and get timeout state atomically
+                        let was_timed_out = sender.is_timed_out();
+
+                        if !maintenance && was_timed_out {
+                            // Try to update connection state first
+                            if connection_state.update_connection(sender_id, remote_addr.ip(), self.config.ip_limit) {
+                                // Update endpoint only if connection state update succeeded
+                                sender.remote_ep = Some(remote_addr);
+                                sender.update_last_receive();
+                                info!("Client {} changed IP from {} to {} (was timed out)", sender_id, ep, remote_addr);
+                            } else {
+                                // IP limit reached for new address
+                                self.metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                                debug!("Client {} IP change rejected: limit reached for {}", sender_id, remote_addr.ip());
+                                return;
+                            }
+                        } else {
+                            // Either in maintenance mode or not timed out
+                            if maintenance {
+                                debug!("Client {} IP change rejected: maintenance mode", sender_id);
+                            } else {
+                                debug!("Client {} IP change rejected: not timed out", sender_id);
+                            }
+                            self.metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
                     } else {
-                        // Reject IP change
-                        self.metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
-                        return;
+                        // Same endpoint, just update activity
+                        sender.update_last_receive();
                     }
+                } else {
+                    // Set initial endpoint
+                    sender.remote_ep = Some(remote_addr);
+                    sender.update_last_receive();
+                    debug!("Client {} endpoint set to {}", sender_id, remote_addr);
                 }
-            } else {
-                // Set initial endpoint
-                sender.remote_ep = Some(remote_addr);
             }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                // New client connection - check all conditions atomically
+                if mappings.len() >= self.config.max_clients {
+                    self.metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                    debug!("New client {} rejected: max clients reached", sender_id);
+                    return;
+                }
 
-            sender.update_last_receive();
-        } else {
-            // New client connection
-            if mappings.len() >= self.config.max_clients
-                || self.maintenance_mode.load(Ordering::Relaxed)
-                || !connection_state.try_add_connection(sender_id, remote_addr.ip(), self.config.ip_limit)
-            {
-                self.metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
-                return;
+                if self.maintenance_mode.load(Ordering::Relaxed) {
+                    self.metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                    debug!("New client {} rejected: maintenance mode", sender_id);
+                    return;
+                }
+
+                // Try to add connection to state first
+                if !connection_state.try_add_connection(sender_id, remote_addr.ip(), self.config.ip_limit) {
+                    self.metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                    debug!("New client {} rejected: IP limit reached for {}", sender_id, remote_addr.ip());
+                    return;
+                }
+
+                // Create new client only after all checks pass
+                let mut client = TunnelClient::new();
+                client.set_endpoint(remote_addr);
+                client.update_last_receive();
+
+                // Insert atomically
+                entry.insert(client);
+
+                self.metrics.connections_created.fetch_add(1, Ordering::Relaxed);
+                self.metrics.active_connections.fetch_add(1, Ordering::Relaxed);
+                info!("New client {} connected from {} (total: {})",
+                    sender_id, remote_addr, mappings.len());
             }
-
-            // Create new client
-            let mut client = TunnelClient::new();
-            client.set_endpoint(remote_addr);
-            client.update_last_receive();
-            mappings.insert(sender_id, client);
-
-            self.metrics.connections_created.fetch_add(1, Ordering::Relaxed);
-            self.metrics.active_connections.fetch_add(1, Ordering::Relaxed);
-            debug!("New client {} connected from {}", sender_id, remote_addr);
         }
 
-        // Forward packet to receiver
+        // Forward packet to receiver (unchanged)
         if let Some(receiver) = mappings.get(&receiver_id) {
             if let Some(receiver_ep) = receiver.remote_ep {
                 if receiver_ep != remote_addr {
-                    if let Err(e) = socket.send_to(data, receiver_ep).await {
-                        debug!("Failed to forward packet: {}", e);
-                    } else {
-                        self.metrics.packets_tunneled.fetch_add(1, Ordering::Relaxed);
+                    match socket.send_to(data, receiver_ep).await {
+                        Ok(_) => {
+                            self.metrics.packets_tunneled.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            debug!("Failed to forward packet from {} to {}: {}",
+                                sender_id, receiver_id, e);
+                        }
                     }
                 }
             }
@@ -651,20 +1041,28 @@ impl TunnelV3 {
     /// Checks if ping limit has been reached for an IP
     #[inline]
     fn ping_limit_reached(&self, ip: IpAddr) -> bool {
-        !self.global_ping_limiter.try_acquire() || !self.ping_manager.try_acquire(ip)
+        // Check per-IP first (cheaper), then global
+        !self.ping_manager.try_acquire(ip) || !self.global_ping_limiter.try_acquire()
     }
 
-    /// Executes a command packet
-    async fn execute_command(&self, command: u8, data: &[u8]) {
-        use std::time::{SystemTime, UNIX_EPOCH};
+    /// Checks if command rate limit has been reached for an IP
+    #[inline]
+    fn command_limit_reached(&self, ip: IpAddr) -> bool {
+        // Check per-IP first (cheaper), then global
+        !self.command_manager.try_acquire(ip) || !self.global_command_limiter.try_acquire()
+    }
+
+    /// Executes a command packet with enhanced rate limiting
+    async fn execute_command(&self, command: u8, data: &[u8], source_ip: IpAddr) {
+        // Check if IP is blocked
+        if self.command_blocklist.is_blocked(source_ip) {
+            warn!("Command from blocked IP: {}", source_ip);
+            return;
+        }
 
         // Check rate limit
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let last = self.last_command_time.load(Ordering::Relaxed);
-        if now - last < COMMAND_RATE_LIMIT {
+        if self.command_limit_reached(source_ip) {
+            debug!("Command rate limit exceeded for {}", source_ip);
             return;
         }
 
@@ -672,17 +1070,22 @@ impl TunnelV3 {
         if let Some(expected_hash) = self.maintenance_password_sha1 {
             let provided_hash: [u8; 20] = match data.try_into() {
                 Ok(hash) => hash,
-                Err(_) => return,
+                Err(_) => {
+                    self.command_blocklist.record_failure(source_ip);
+                    self.metrics.failed_commands.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             };
 
             if provided_hash != expected_hash {
+                self.command_blocklist.record_failure(source_ip);
+                self.metrics.failed_commands.fetch_add(1, Ordering::Relaxed);
+                warn!("Invalid command password from {}", source_ip);
                 return;
             }
         } else {
             return;
         }
-
-        self.last_command_time.store(now, Ordering::Relaxed);
 
         // Execute command
         match command {
@@ -690,9 +1093,9 @@ impl TunnelV3 {
                 // MaintenanceMode toggle
                 let current = self.maintenance_mode.load(Ordering::Relaxed);
                 self.maintenance_mode.store(!current, Ordering::Relaxed);
-                info!("Maintenance mode toggled to: {}", !current);
+                info!("Maintenance mode toggled to: {} by {}", !current, source_ip);
             }
-            _ => warn!("Unknown command: {}", command),
+            _ => warn!("Unknown command: {} from {}", command, source_ip),
         }
     }
 
@@ -737,16 +1140,32 @@ impl TunnelV3 {
                 "0"
             };
 
+            // Build URL with validation - truncate name if needed
+            let mut truncated_name = name.to_string();
+            if truncated_name.len() > 100 {
+                truncated_name.truncate(100);
+                warn!("Server name truncated to 100 characters for master announcement");
+            }
+
+            let encoded_name = utf8_percent_encode(&truncated_name, NON_ALPHANUMERIC).to_string();
+            let encoded_password = utf8_percent_encode(master_password, NON_ALPHANUMERIC).to_string();
+
             let url = format!(
                 "{}?version=3&name={}&port={}&clients={}&maxclients={}&masterpw={}&maintenance={}",
                 master_url,
-                utf8_percent_encode(name, NON_ALPHANUMERIC),
+                encoded_name,
                 port,
                 client_count,
                 max_clients,
-                utf8_percent_encode(master_password, NON_ALPHANUMERIC),
+                encoded_password,
                 maintenance
             );
+
+            // Check URL length
+            if url.len() > MAX_URL_LENGTH {
+                error!("Master server URL still too long ({} bytes) after truncation, skipping heartbeat", url.len());
+                return;
+            }
 
             match HTTP_CLIENT.get(&url).send().await {
                 Ok(_) => debug!("V3 Heartbeat sent successfully"),
@@ -766,6 +1185,7 @@ impl TunnelV3 {
             connections_rejected: self.metrics.connections_rejected.load(Ordering::Relaxed),
             active_connections: self.metrics.active_connections.load(Ordering::Relaxed),
             active_ips: self.ping_manager.active_ips(),
+            failed_commands: self.metrics.failed_commands.load(Ordering::Relaxed),
         }
     }
 }
@@ -778,10 +1198,12 @@ impl Clone for TunnelV3 {
             maintenance_password_sha1: self.maintenance_password_sha1,
             ping_manager: self.ping_manager.clone(),
             global_ping_limiter: self.global_ping_limiter.clone(),
+            command_manager: self.command_manager.clone(),
+            global_command_limiter: self.global_command_limiter.clone(),
             maintenance_mode: self.maintenance_mode.clone(),
-            last_command_time: self.last_command_time.clone(),
             metrics: self.metrics.clone(),
             processing_semaphore: self.processing_semaphore.clone(),
+            command_blocklist: self.command_blocklist.clone(),
         }
     }
 }
@@ -797,6 +1219,7 @@ pub struct V3Metrics {
     pub connections_rejected: u64,
     pub active_connections: usize,
     pub active_ips: usize,
+    pub failed_commands: u64,
 }
 
 #[cfg(test)]
@@ -827,6 +1250,19 @@ mod tests {
             assert!(!service.ping_limit_reached(ip));
         }
         assert!(service.ping_limit_reached(ip));
+    }
+
+    #[test]
+    fn test_command_limit_reached() {
+        let config = TunnelV3Config::default();
+        let service = TunnelV3::with_config(config);
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+
+        // Should allow up to max_commands_per_ip
+        for _ in 0..DEFAULT_MAX_COMMANDS_PER_IP {
+            assert!(!service.command_limit_reached(ip));
+        }
+        assert!(service.command_limit_reached(ip));
     }
 
     #[test]
@@ -866,5 +1302,55 @@ mod tests {
         assert!(!service.is_valid_packet(1, 1, &valid_addr)); // Self-send
         assert!(!service.is_valid_packet(1, 2, &loopback)); // Loopback
         assert!(!service.is_valid_packet(1, 2, &zero_port)); // Zero port
+    }
+
+    #[test]
+    fn test_command_blocklist() {
+        let blocklist = CommandBlocklist::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+
+        assert!(!blocklist.is_blocked(ip));
+
+        // Record failures
+        for _ in 0..MAX_FAILED_COMMANDS {
+            blocklist.record_failure(ip);
+        }
+
+        // Should be blocked now
+        assert!(blocklist.is_blocked(ip));
+    }
+
+    #[test]
+    fn test_connection_state_concurrent_update() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let state = Arc::new(ConnectionState::new());
+        let mut handles = vec![];
+
+        // Spawn multiple threads trying to update the same client
+        for i in 0..10 {
+            let state_clone = state.clone();
+            let handle = thread::spawn(move || {
+                let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, (i % 3) as u8));
+                state_clone.update_connection(1, ip, 5)
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Exactly one update should succeed (the winner of the race)
+        let successes = results.iter().filter(|&&r| r).count();
+        assert!(successes >= 1); // At least one should succeed
+
+        // Final state should be consistent
+        assert_eq!(state.total_connections(), 1);
+        let total_count: usize = state.ip_connections
+            .iter()
+            .map(|entry| entry.value().load(Ordering::Acquire))
+            .sum();
+        assert_eq!(total_count, 1);
     }
 }

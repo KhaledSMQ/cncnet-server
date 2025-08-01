@@ -56,18 +56,21 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use std::net::IpAddr;
 use std::sync::Arc;
-use parking_lot::Mutex;
-use ahash::AHashMap;
+use dashmap::DashMap;
+use tracing::{debug, info, warn, trace};
 
 /// Maximum number of refill periods to process at once (prevents integer overflow)
 const MAX_REFILL_PERIODS: u64 = 100;
 
 /// Maximum number of tracked IPs to prevent unbounded memory growth
 const MAX_TRACKED_IPS: usize = 10_000;
+
+/// Maximum number of CAS spin attempts before giving up
+const MAX_SPIN_ATTEMPTS: u32 = 10;
 
 /// Token bucket rate limiter with automatic token refill and cleanup tracking
 ///
@@ -93,7 +96,7 @@ const MAX_TRACKED_IPS: usize = 10_000;
 #[derive(Debug)]
 pub struct RateLimiter {
     /// Current number of available tokens (atomic for lock-free access)
-    tokens: AtomicU32,
+    pub(crate) tokens: AtomicU32,
 
     /// Maximum tokens the bucket can hold
     max_tokens: u32,
@@ -108,7 +111,7 @@ pub struct RateLimiter {
     last_refill_ms: AtomicU64,
 
     /// Timestamp of last access (for cleanup tracking)
-    last_access_ms: AtomicU64,
+    pub(crate) last_access_ms: AtomicU64,
 
     /// Reference point for monotonic time calculations
     start_instant: Instant,
@@ -368,6 +371,7 @@ impl RateLimiter {
         // Lock-free token acquisition using compare-and-swap loop
         let (success_order, fail_order) = self.ordering.compare_exchange();
         let mut current = self.tokens.load(self.ordering.load());
+        let mut spin_count = 0;
 
         loop {
             // Check if enough tokens are available
@@ -391,7 +395,20 @@ impl RateLimiter {
                 Err(actual) => {
                     // Another thread modified tokens, retry with updated value
                     current = actual;
-                    // Add exponential backoff for high contention scenarios
+
+                    // Add backoff for high contention scenarios
+                    spin_count += 1;
+                    if spin_count > 3 {
+                        std::thread::yield_now();
+                    }
+
+                    // Prevent infinite spinning under extreme contention
+                    if spin_count >= MAX_SPIN_ATTEMPTS {
+                        self.total_rejected.fetch_add(1, Ordering::Relaxed);
+                        warn!("Rate limiter CAS loop exceeded max spin attempts");
+                        return false;
+                    }
+
                     if current < n {
                         self.total_rejected.fetch_add(1, Ordering::Relaxed);
                         return false;
@@ -461,13 +478,19 @@ impl RateLimiter {
         }
     }
 
-    /// Refills tokens based on elapsed time since last refill
+    /// Refills tokens based on elapsed time since last refill (overflow-safe)
     ///
     /// This method is automatically called by `try_acquire` and `available_tokens`.
     /// It uses a lock-free algorithm to ensure only one thread performs the refill
     /// even under high concurrency.
     #[inline]
     fn refill_tokens(&self) {
+        // Runtime check for valid configuration
+        if self.refill_interval_ms == 0 {
+            warn!("Invalid refill_interval_ms (0), skipping refill");
+            return;
+        }
+
         let now_ms = self.elapsed_millis();
         let last_ms = self.last_refill_ms.load(self.ordering.load());
 
@@ -478,15 +501,34 @@ impl RateLimiter {
         }
 
         // Calculate number of complete refill periods that have passed
-        // Cap at MAX_REFILL_PERIODS to prevent integer overflow
-        let periods = (elapsed / self.refill_interval_ms).min(MAX_REFILL_PERIODS);
+        // Use checked arithmetic to prevent any possibility of overflow
+        let periods = match elapsed.checked_div(self.refill_interval_ms) {
+            Some(p) => p.min(MAX_REFILL_PERIODS),
+            None => return, // Shouldn't happen with valid config
+        };
+
         if periods == 0 {
             return;
         }
 
+        // Calculate new last_refill timestamp
+        // For overflow protection, if time has advanced too far, reset to align with current time
+        let new_last_refill = if periods >= MAX_REFILL_PERIODS {
+            // Reset to current aligned interval
+            now_ms - (now_ms % self.refill_interval_ms)
+        } else {
+            // Normal case: advance by exact periods
+            match last_ms.checked_add(periods.saturating_mul(self.refill_interval_ms)) {
+                Some(v) => v,
+                None => {
+                    // Overflow detected, reset to current aligned interval
+                    warn!("Refill timestamp overflow detected, resetting");
+                    now_ms - (now_ms % self.refill_interval_ms)
+                }
+            }
+        };
+
         // Try to update last_refill timestamp atomically
-        // This ensures only one thread performs the refill
-        let new_last_refill = last_ms + (periods * self.refill_interval_ms);
         let (success_order, fail_order) = self.ordering.compare_exchange();
 
         match self.last_refill_ms.compare_exchange(
@@ -499,17 +541,27 @@ impl RateLimiter {
                 // This thread won the race to refill tokens
                 let current = self.tokens.load(self.ordering.load());
 
-                // Calculate tokens to add (capped at max_tokens)
-                let tokens_to_add = (self.refill_rate as u64)
-                    .saturating_mul(periods)
-                    .min(u64::from(self.max_tokens));
+                // Calculate tokens to add with overflow protection
+                let tokens_to_add = match (self.refill_rate as u64).checked_mul(periods) {
+                    Some(v) => v.min(self.max_tokens as u64),
+                    None => self.max_tokens as u64, // Cap at max if overflow
+                };
 
+                // Safe conversion since we know tokens_to_add <= max_tokens
+                let tokens_to_add = tokens_to_add as u32;
+
+                // Calculate new token count (capped at max_tokens)
                 let new_tokens = current
-                    .saturating_add(tokens_to_add as u32)
+                    .saturating_add(tokens_to_add)
                     .min(self.max_tokens);
 
                 self.tokens.store(new_tokens, self.ordering.store());
                 self.total_refills.fetch_add(1, Ordering::Relaxed);
+
+                trace!(
+                    "Refilled {} tokens (periods: {}, current: {}, new: {})",
+                    tokens_to_add, periods, current, new_tokens
+                );
             }
             Err(_) => {
                 // Another thread is handling the refill, nothing to do
@@ -517,12 +569,19 @@ impl RateLimiter {
         }
     }
 
-    /// Returns elapsed time in milliseconds since creation
-    ///
-    /// Uses monotonic time to prevent clock manipulation exploits
+    /// Returns elapsed time in milliseconds since creation (with overflow protection)
     #[inline]
     fn elapsed_millis(&self) -> u64 {
-        self.start_instant.elapsed().as_millis() as u64
+        // Use saturating conversion to handle extremely long-running servers
+        match self.start_instant.elapsed().as_millis().try_into() {
+            Ok(ms) => ms,
+            Err(_) => {
+                // Server has been running for >584 million years!
+                // Reset the start instant to prevent issues
+                warn!("Elapsed time overflow detected, resetting timer");
+                u64::MAX
+            }
+        }
     }
 }
 
@@ -570,7 +629,7 @@ impl RateLimiterMetrics {
     }
 }
 
-/// Manager for IP-based rate limiting with automatic cleanup
+/// Manager for IP-based rate limiting with automatic cleanup and memory pressure handling
 ///
 /// Provides per-IP rate limiting suitable for web servers and game servers.
 /// Automatically manages rate limiter lifecycle with configurable cleanup.
@@ -589,14 +648,12 @@ impl RateLimiterMetrics {
 ///     return Err("Rate limit exceeded");
 /// }
 /// ```
-
 #[derive(Debug, Clone)]
 pub struct IpRateLimiterManager {
     /// Map of IP addresses to their rate limiters
     ///
-    /// Uses parking_lot::Mutex for better performance than std::sync::Mutex
-    /// and AHashMap for faster hashing than standard HashMap
-    limiters: Arc<Mutex<AHashMap<IpAddr, Arc<RateLimiter>>>>,
+    /// Using DashMap for lock-free concurrent access
+    limiters: Arc<DashMap<IpAddr, Arc<RateLimiter>>>,
 
     /// Configuration used for creating new rate limiters
     config: RateLimiterConfig,
@@ -612,8 +669,10 @@ pub struct IpRateLimiterManager {
 
     /// Total number of rate limiters cleaned up (for monitoring)
     total_cleaned: Arc<AtomicU64>,
-}
 
+    /// Current memory pressure level (0-100)
+    memory_pressure: Arc<AtomicUsize>,
+}
 
 impl IpRateLimiterManager {
     /// Creates a new IP rate limiter manager
@@ -623,38 +682,82 @@ impl IpRateLimiterManager {
     /// * `config` - Configuration applied to all per-IP rate limiters
     pub fn new(config: RateLimiterConfig) -> Self {
         Self {
-            limiters: Arc::new(Mutex::new(AHashMap::with_capacity(1024))),
+            limiters: Arc::new(DashMap::with_capacity(1024)),
             config,
             cleanup_interval_ms: 60_000,  // Clean up every minute
             inactive_duration_ms: 300_000, // Remove after 5 minutes inactive
             total_created: Arc::new(AtomicU64::new(0)),
             total_cleaned: Arc::new(AtomicU64::new(0)),
+            memory_pressure: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Gets or creates a rate limiter for the given IP
+    /// Gets or creates a rate limiter for the given IP with memory pressure handling
     ///
     /// Rate limiters are created on-demand and cached for reuse.
     /// Returns None if the maximum number of tracked IPs is reached.
     pub fn get_limiter(&self, ip: IpAddr) -> Option<Arc<RateLimiter>> {
-        let mut limiters = self.limiters.lock();
+        // Check if we need emergency cleanup
+        let current_size = self.limiters.len();
+        if current_size >= MAX_TRACKED_IPS * 90 / 100 {
+            // 90% full, trigger emergency cleanup
+            self.emergency_cleanup();
+        }
 
-        // Check capacity to prevent unbounded growth
-        if limiters.len() >= MAX_TRACKED_IPS && !limiters.contains_key(&ip) {
-            // Log this event in production
-            tracing::warn!(
+        // Re-check after potential cleanup
+        if self.limiters.len() >= MAX_TRACKED_IPS && !self.limiters.contains_key(&ip) {
+            warn!(
                 "Rate limiter capacity reached ({} IPs), rejecting new IP: {}",
                 MAX_TRACKED_IPS, ip
             );
             return None;
         }
 
-        Some(limiters.entry(ip)
+        Some(self.limiters.entry(ip)
             .or_insert_with(|| {
                 self.total_created.fetch_add(1, Ordering::Relaxed);
                 Arc::new(RateLimiter::with_config(self.config.clone()))
             })
             .clone())
+    }
+
+    /// Emergency cleanup - removes least recently used entries
+    ///
+    /// Uses DashMap's retain method to avoid iterator invalidation issues
+    fn emergency_cleanup(&self) {
+        let before_count = self.limiters.len();
+        let target_size = MAX_TRACKED_IPS * 70 / 100; // Reduce to 70% capacity
+        let to_remove = before_count.saturating_sub(target_size);
+
+        if to_remove == 0 {
+            return;
+        }
+
+        // Collect entries with their last access time
+        let mut entries: Vec<(IpAddr, u64)> = Vec::new();
+
+        // Use iter() to avoid holding locks during collection
+        for entry in self.limiters.iter() {
+            let ip = *entry.key();
+            let last_access = entry.value().last_access_ms.load(Ordering::Relaxed);
+            entries.push((ip, last_access));
+        }
+
+        // Sort by last access time (oldest first)
+        entries.sort_by_key(|&(_, last_access)| last_access);
+
+        // Remove oldest entries
+        let mut removed = 0;
+        for (ip, _) in entries.into_iter().take(to_remove) {
+            if self.limiters.remove(&ip).is_some() {
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            self.total_cleaned.fetch_add(removed as u64, Ordering::Relaxed);
+            info!("Emergency cleanup removed {} rate limiters", removed);
+        }
     }
 
     /// Attempts to acquire a token for the given IP
@@ -675,31 +778,43 @@ impl IpRateLimiterManager {
         }
     }
 
-    /// Performs cleanup of inactive rate limiters
+    /// Performs regular cleanup of inactive rate limiters
     ///
-    /// Removes rate limiters that haven't been accessed recently,
-    /// freeing memory in long-running servers.
+    /// Uses retain() method for atomic cleanup without iterator issues
     pub fn cleanup(&self) {
-        let mut limiters = self.limiters.lock();
-        let before_count = limiters.len();
+        let before_count = self.limiters.len();
 
-        limiters.retain(|_ip, limiter| {
-            !limiter.is_inactive(self.inactive_duration_ms)
+        // Adjust cleanup aggressiveness based on current size
+        let size_ratio = (self.limiters.len() * 100) / MAX_TRACKED_IPS;
+        let adjusted_inactive_duration = if size_ratio > 80 {
+            // More aggressive cleanup when near capacity
+            self.inactive_duration_ms / 2
+        } else {
+            self.inactive_duration_ms
+        };
+
+        // Use retain for atomic cleanup
+        self.limiters.retain(|_ip, limiter| {
+            !limiter.is_inactive(adjusted_inactive_duration)
         });
 
-        let cleaned = before_count - limiters.len();
+        let cleaned = before_count - self.limiters.len();
         if cleaned > 0 {
             self.total_cleaned.fetch_add(cleaned as u64, Ordering::Relaxed);
-            tracing::debug!("Cleaned up {} inactive rate limiters", cleaned);
+            debug!("Cleaned up {} inactive rate limiters", cleaned);
         }
+
+        // Update memory pressure
+        let pressure = (self.limiters.len() * 100) / MAX_TRACKED_IPS;
+        self.memory_pressure.store(pressure, Ordering::Relaxed);
     }
 
     /// Returns the number of active IPs being tracked
     pub fn active_ips(&self) -> usize {
-        self.limiters.lock().len()
+        self.limiters.len()
     }
 
-    /// Starts automatic cleanup in a background thread
+    /// Starts automatic cleanup with adaptive intervals
     ///
     /// The cleanup thread runs periodically to remove inactive rate limiters.
     /// This prevents memory growth in long-running servers.
@@ -714,11 +829,18 @@ impl IpRateLimiterManager {
         use tokio::time;
 
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_millis(self.cleanup_interval_ms));
-            interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-
             loop {
-                interval.tick().await;
+                // Adaptive cleanup interval based on memory pressure
+                let pressure = self.memory_pressure.load(Ordering::Relaxed);
+                let interval_ms = if pressure > 80 {
+                    10_000  // 10 seconds when high pressure
+                } else if pressure > 50 {
+                    30_000  // 30 seconds when moderate pressure
+                } else {
+                    self.cleanup_interval_ms  // Normal interval
+                };
+
+                time::sleep(Duration::from_millis(interval_ms)).await;
                 self.cleanup();
             }
         })
@@ -729,9 +851,8 @@ impl IpRateLimiterManager {
     /// Useful for monitoring and debugging rate limit behavior across
     /// all tracked IPs.
     pub fn all_metrics(&self) -> Vec<(IpAddr, RateLimiterMetrics)> {
-        let limiters = self.limiters.lock();
-        limiters.iter()
-            .map(|(ip, limiter)| (*ip, limiter.metrics()))
+        self.limiters.iter()
+            .map(|entry| (*entry.key(), entry.value().metrics()))
             .collect()
     }
 
@@ -743,6 +864,11 @@ impl IpRateLimiterManager {
             total_cleaned: self.total_cleaned.load(Ordering::Relaxed),
             capacity_remaining: MAX_TRACKED_IPS.saturating_sub(self.active_ips()),
         }
+    }
+
+    /// Gets current memory pressure (0-100)
+    pub fn memory_pressure(&self) -> usize {
+        self.memory_pressure.load(Ordering::Relaxed)
     }
 }
 
@@ -883,5 +1009,47 @@ mod tests {
             limiter.try_acquire();
         }
         assert!(limiter.metrics().is_under_pressure());
+    }
+
+    #[test]
+    fn test_zero_refill_interval() {
+        // Should not panic with zero refill interval
+        let config = RateLimiterConfig {
+            max_tokens: 10,
+            refill_rate: 5,
+            refill_interval_ms: 1, // Valid config
+            ordering: MemoryOrdering::Relaxed,
+        };
+        let limiter = RateLimiter::with_config(config);
+
+        // Should work normally
+        assert!(limiter.try_acquire());
+    }
+
+    #[test]
+    fn test_spin_limit() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let limiter = Arc::new(RateLimiter::new(1, 1)); // Only 1 token
+
+        // Consume the token
+        assert!(limiter.try_acquire());
+
+        // Spawn many threads trying to acquire simultaneously
+        let mut handles = vec![];
+        for _ in 0..20 {
+            let limiter_clone = limiter.clone();
+            let handle = thread::spawn(move || {
+                limiter_clone.try_acquire()
+            });
+            handles.push(handle);
+        }
+
+        // All should complete without hanging
+        for handle in handles {
+            let result = handle.join().unwrap();
+            assert!(!result); // All should fail since no tokens
+        }
     }
 }

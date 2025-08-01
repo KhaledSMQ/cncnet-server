@@ -86,7 +86,7 @@ impl Default for PeerToPeerConfig {
     }
 }
 
-/// Response buffer pool to avoid allocations
+/// Response buffer pool to avoid allocations with deterministic initialization
 struct ResponseBufferPool {
     /// Pre-generated base response buffers
     buffers: Vec<[u8; RESPONSE_SIZE]>,
@@ -95,16 +95,18 @@ struct ResponseBufferPool {
 }
 
 impl ResponseBufferPool {
-    /// Creates a new buffer pool with pre-initialized buffers
+    /// Creates a new buffer pool with deterministic initialization
     fn new(size: usize) -> Self {
         let mut buffers = Vec::with_capacity(size);
 
-        for _ in 0..size {
+        for i in 0..size {
             let mut buffer = [0u8; RESPONSE_SIZE];
 
-            // Initialize with random data for protocol noise
-            use rand::RngCore;
-            rand::rng().fill_bytes(&mut buffer);
+            // Initialize with deterministic pattern (not random)
+            // This provides protocol noise without the overhead of RNG
+            for (j, byte) in buffer.iter_mut().enumerate() {
+                *byte = ((i * 31 + j * 17) % 256) as u8;
+            }
 
             // Set fixed STUN_ID at offset 6 (big-endian)
             let stun_bytes = STUN_ID.to_be_bytes();
@@ -114,6 +116,8 @@ impl ResponseBufferPool {
             buffers.push(buffer);
         }
 
+        debug!("Created response buffer pool with {} buffers", size);
+
         Self {
             buffers,
             index: AtomicUsize::new(0),
@@ -121,9 +125,15 @@ impl ResponseBufferPool {
     }
 
     /// Gets a response buffer (round-robin from pool)
+    #[inline]
     pub fn get_buffer(&self) -> [u8; RESPONSE_SIZE] {
         let idx = self.index.fetch_add(1, Ordering::Relaxed) % self.buffers.len();
         self.buffers[idx]
+    }
+
+    /// Gets the size of the buffer pool
+    pub fn size(&self) -> usize {
+        self.buffers.len()
     }
 }
 
@@ -228,9 +238,9 @@ impl PeerToPeerService {
         self,
     ) -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<Result<()>>)> {
         info!(
-        "Starting peer-to-peer service on port {} with config: {:?}",
-        self.config.port, self.config
-    );
+            "Starting peer-to-peer service on port {} with config: {:?}",
+            self.config.port, self.config
+        );
 
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
@@ -253,7 +263,6 @@ impl PeerToPeerService {
 
         Ok((shutdown_tx, handle))
     }
-
 
     /// Internal run loop for the service.
     async fn run(self, socket: Arc<UdpSocket>, mut shutdown_rx: Receiver<()>) -> Result<()> {
@@ -354,13 +363,33 @@ impl PeerToPeerService {
             return;
         }
 
-        // Early reject IPv6 (protocol is IPv4-only)
+        // Extract IP from address
         let ip = remote_addr.ip();
+
+        // Early reject IPv6 (protocol is IPv4-only)
         if ip.is_ipv6() {
             self.metrics.packets_invalid.fetch_add(1, Ordering::Relaxed);
             debug!("Ignored IPv6 request from {}", remote_addr);
             return;
         }
+
+        // Extract IP from address
+        let ip = remote_addr.ip();
+
+        // Early reject IPv6 BEFORE rate limiting (protocol is IPv4-only)
+        if ip.is_ipv6() {
+            self.metrics.packets_invalid.fetch_add(1, Ordering::Relaxed);
+            debug!("Ignored IPv6 request from {}", remote_addr);
+            return;
+        }
+
+        // NOW check rate limits after basic validation
+        if !self.check_rate_limits(ip) {
+            self.metrics.packets_rate_limited.fetch_add(1, Ordering::Relaxed);
+            debug!("Rate limit exceeded for {}", remote_addr);
+            return;
+        }
+
 
         // Check rate limits (global first for quick rejection)
         if !self.check_rate_limits(ip) {
@@ -378,9 +407,12 @@ impl PeerToPeerService {
         }
 
         // Extract IPv4 bytes (safe after is_ipv6 check)
-        let ip_bytes = match ip {
-            IpAddr::V4(v4) => v4.octets(),
-            _ => unreachable!(),
+        let ip_bytes = if let IpAddr::V4(v4) = ip {
+            v4.octets()
+        } else {
+            // This is technically unreachable after the is_ipv6 check
+            // but we handle it explicitly for safety
+            unreachable!("IP must be V4 after is_ipv6 check")
         };
 
         // Get response buffer from pool
@@ -429,13 +461,22 @@ impl PeerToPeerService {
     /// Returns true if allowed, false if rate limited
     #[inline]
     pub fn check_rate_limits(&self, ip: IpAddr) -> bool {
-        // Global limit first (fail fast)
-        if !self.global_limiter.try_acquire() {
+        // Per-IP limit first (cheaper, fails fast for repeat offenders)
+        if !self.per_ip_manager.try_acquire(ip) {
             return false;
         }
 
-        // Per-IP limit
-        self.per_ip_manager.try_acquire(ip)
+        // Global limit second
+        if !self.global_limiter.try_acquire() {
+            // Roll back per-IP acquisition by adding a token back
+            if let Some(limiter) = self.per_ip_manager.get_limiter(ip) {
+                // Note: This is a best-effort rollback
+                limiter.tokens.fetch_add(1, Ordering::Relaxed);
+            }
+            return false;
+        }
+
+        true
     }
 
     /// Gets current service metrics
@@ -578,5 +619,43 @@ mod tests {
         assert_eq!(metrics.packets_received, 10);
         assert_eq!(metrics.packets_processed, 8);
         assert_eq!(metrics.packets_rate_limited, 2);
+    }
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use super::*;
+
+    #[test]
+    fn test_buffer_pool_initialization() {
+        let pool = ResponseBufferPool::new(10);
+
+        // Check that buffers are initialized
+        for i in 0..10 {
+            let buffer = pool.get_buffer();
+
+            // Verify STUN_ID is set correctly
+            let stun_bytes = STUN_ID.to_be_bytes();
+            assert_eq!(buffer[6], stun_bytes[0]);
+            assert_eq!(buffer[7], stun_bytes[1]);
+
+            // Verify buffer is not all zeros
+            let non_zero_count = buffer.iter().filter(|&&b| b != 0).count();
+            assert!(non_zero_count > RESPONSE_SIZE / 2);
+        }
+    }
+
+    #[test]
+    fn test_buffer_pool_round_robin() {
+        let pool = ResponseBufferPool::new(3);
+
+        // Get buffers and verify round-robin behavior
+        let buf1 = pool.get_buffer();
+        let buf2 = pool.get_buffer();
+        let buf3 = pool.get_buffer();
+        let buf4 = pool.get_buffer(); // Should wrap around to first
+
+        // Due to deterministic initialization, buf1 and buf4 should match
+        assert_eq!(buf1[0], buf4[0]);
     }
 }
