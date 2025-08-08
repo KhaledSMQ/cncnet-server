@@ -23,10 +23,30 @@ const COMMAND_RATE_LIMIT: u64 = 60;
 const MAX_PINGS_PER_IP: usize = 20;
 const MAX_PINGS_GLOBAL: usize = 5000;
 const TIMEOUT_SECONDS: u64 = 30;
-const BATCH_SIZE: usize = 32;
-const MAX_PACKET_SIZE: usize = 1472; // Typical MTU - IP/UDP headers
 
-// Backpressure controller
+// ARM-optimized batch size (better cache utilization)
+#[cfg(target_arch = "aarch64")]
+const BATCH_SIZE: usize = 64;
+
+#[cfg(not(target_arch = "aarch64"))]
+const BATCH_SIZE: usize = 32;
+
+const MAX_PACKET_SIZE: usize = 1472;
+
+// ARM-optimized memory ordering
+#[cfg(target_arch = "aarch64")]
+const LOAD_ORDERING: Ordering = Ordering::Acquire;
+
+#[cfg(target_arch = "aarch64")]
+const STORE_ORDERING: Ordering = Ordering::Release;
+
+#[cfg(not(target_arch = "aarch64"))]
+const LOAD_ORDERING: Ordering = Ordering::SeqCst;
+
+#[cfg(not(target_arch = "aarch64"))]
+const STORE_ORDERING: Ordering = Ordering::SeqCst;
+
+// Backpressure controller with ARM optimizations
 pub struct BackpressureController {
     current_load: AtomicU64,
     max_load: u64,
@@ -44,16 +64,14 @@ impl BackpressureController {
         }
     }
 
+    #[inline(always)]
     pub fn should_accept(&self) -> bool {
-        let load = self.current_load.load(Ordering::Acquire);
+        let load = self.current_load.load(LOAD_ORDERING);
 
-        // Below 70% capacity, always accept
         if load < (self.max_load * 70) / 100 {
             return true;
         }
 
-        // Calculate rejection probability based on load
-        // Linear from 0% at 70% load to 100% at 100% load
         let load_percentage = (load * 100) / self.max_load;
         let rejection_prob = if load_percentage >= 70 {
             ((load_percentage - 70) * 1000) / 30
@@ -61,9 +79,8 @@ impl BackpressureController {
             0
         };
 
-        self.rejection_probability.store(rejection_prob as u32, Ordering::Release);
+        self.rejection_probability.store(rejection_prob as u32, STORE_ORDERING);
 
-        // Random rejection based on probability
         use rand::Rng;
         let accept = rand::thread_rng().gen_range(0..1000) >= rejection_prob;
 
@@ -74,17 +91,19 @@ impl BackpressureController {
         accept
     }
 
+    #[inline(always)]
     pub fn increment_load(&self) -> bool {
         let prev = self.current_load.fetch_add(1, Ordering::AcqRel);
         prev < self.max_load
     }
 
+    #[inline(always)]
     pub fn decrement_load(&self) {
         self.current_load.fetch_sub(1, Ordering::AcqRel);
     }
 
     pub fn get_load_percentage(&self) -> f64 {
-        let load = self.current_load.load(Ordering::Acquire);
+        let load = self.current_load.load(LOAD_ORDERING);
         (load as f64 / self.max_load as f64) * 100.0
     }
 }
@@ -126,11 +145,18 @@ impl TunnelV3 {
             .build()
             .expect("Failed to create HTTP client");
 
+        // ARM can handle more concurrent connections efficiently
+        #[cfg(target_arch = "aarch64")]
+        let max_backpressure = 15000;
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let max_backpressure = 10000;
+
         Self {
             connection_limiter: Arc::new(ConnectionLimiter::new(config.ip_limit)),
             ping_limiter: Arc::new(RateLimiter::new(60, MAX_PINGS_PER_IP, MAX_PINGS_GLOBAL)),
             mappings: Arc::new(DashMap::with_capacity(config.max_clients)),
-            backpressure: Arc::new(BackpressureController::new(10000)),
+            backpressure: Arc::new(BackpressureController::new(max_backpressure)),
             quality_analyzers: Arc::new(DashMap::with_capacity(config.max_clients)),
             config,
             metrics,
@@ -143,7 +169,6 @@ impl TunnelV3 {
     }
 
     pub async fn start(self: Arc<Self>) -> Result<()> {
-        // Create optimized UDP socket
         let socket = self.create_optimized_socket().await?;
         let socket = Arc::new(socket);
 
@@ -155,14 +180,19 @@ impl TunnelV3 {
             heartbeat_self.heartbeat_loop().await;
         });
 
-        // Spawn buffer pool maintenance task
+        // Spawn buffer pool maintenance
         tokio::spawn(buffer_pool::maintenance_task());
 
-        // Use multiple receive tasks for better parallelism
+        // ARM: Use more receive workers for better core utilization
+        #[cfg(target_arch = "aarch64")]
+        let num_receivers = num_cpus::get().min(4).max(2);
+
+        #[cfg(not(target_arch = "aarch64"))]
         let num_receivers = num_cpus::get().min(8).max(2);
+
         let mut receivers = Vec::with_capacity(num_receivers);
 
-        info!("Starting {} receive workers", num_receivers);
+        info!("Starting {} receive workers (ARM optimized)", num_receivers);
 
         for worker_id in 0..num_receivers {
             let self_clone = self.clone();
@@ -173,7 +203,6 @@ impl TunnelV3 {
             }));
         }
 
-        // Wait for all receivers
         for receiver in receivers {
             let _ = receiver.await;
         }
@@ -184,20 +213,21 @@ impl TunnelV3 {
     async fn create_optimized_socket(&self) -> Result<UdpSocket> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
-        // Set socket options for performance
         socket.set_reuse_address(true)?;
 
         #[cfg(unix)]
         {
             socket.set_reuse_port(true)?;
 
-            // Enable SO_REUSEPORT load balancing on Linux
-            #[cfg(target_os = "linux")]
+            // ARM-specific: Enable SO_REUSEPORT with better load balancing
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
             {
                 use std::os::unix::io::AsRawFd;
                 use libc::{c_int, c_void, setsockopt, SOL_SOCKET};
 
                 const SO_REUSEPORT: c_int = 15;
+                const SO_ATTACH_REUSEPORT_CBPF: c_int = 51;
+
                 let optval: c_int = 1;
                 unsafe {
                     setsockopt(
@@ -211,11 +241,19 @@ impl TunnelV3 {
             }
         }
 
-        // Increase buffer sizes significantly
-        let _ = socket.set_recv_buffer_size(16 * 1024 * 1024); // 16MB
-        let _ = socket.set_send_buffer_size(16 * 1024 * 1024); // 16MB
+        // ARM has excellent memory bandwidth - use larger buffers
+        #[cfg(target_arch = "aarch64")]
+        {
+            let _ = socket.set_recv_buffer_size(32 * 1024 * 1024); // 32MB
+            let _ = socket.set_send_buffer_size(32 * 1024 * 1024); // 32MB
+        }
 
-        // Bind and convert to tokio socket
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = socket.set_recv_buffer_size(16 * 1024 * 1024);
+            let _ = socket.set_send_buffer_size(16 * 1024 * 1024);
+        }
+
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.tunnel_port));
         socket.bind(&addr.into())?;
         socket.set_nonblocking(true)?;
@@ -228,28 +266,42 @@ impl TunnelV3 {
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         let mut receive_errors = 0u32;
 
-        info!("Worker {} started", worker_id);
+        info!("Worker {} started (ARM optimized)", worker_id);
+
+        // ARM: Pin worker to specific CPU for better cache locality
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        {
+            use std::process::Command;
+            let cpu = worker_id % num_cpus::get();
+            let _ = Command::new("taskset")
+                .arg("-cp")
+                .arg(cpu.to_string())
+                .arg(std::process::id().to_string())
+                .output();
+        }
 
         loop {
-            // Check backpressure
             if !self.backpressure.should_accept() {
-                // Under heavy load, slow down receiving
+                // ARM: Shorter sleep due to better context switching
+                #[cfg(target_arch = "aarch64")]
+                tokio::time::sleep(Duration::from_micros(50)).await;
+
+                #[cfg(not(target_arch = "aarch64"))]
                 tokio::time::sleep(Duration::from_micros(100)).await;
+
                 continue;
             }
 
-            // Get buffer from pool
             let mut buf = pool.acquire_medium();
 
             match socket.recv_from(&mut buf).await {
                 Ok((size, addr)) => {
-                    receive_errors = 0; // Reset error counter
+                    receive_errors = 0;
 
                     if size >= 8 && size <= MAX_PACKET_SIZE {
                         buf.truncate(size);
                         batch.push((buf, addr));
 
-                        // Process batch when full or periodically
                         if batch.len() >= BATCH_SIZE {
                             self.process_batch(&socket, &mut batch, worker_id).await;
                         }
@@ -259,7 +311,6 @@ impl TunnelV3 {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Process any pending batch
                     if !batch.is_empty() {
                         self.process_batch(&socket, &mut batch, worker_id).await;
                     }
@@ -270,13 +321,37 @@ impl TunnelV3 {
                     if receive_errors > 100 {
                         error!("Worker {} excessive UDP receive errors: {}", worker_id, e);
                         receive_errors = 0;
-                    } else if receive_errors % 10 == 0 {
-                        warn!("Worker {} UDP receive error ({}): {}", worker_id, receive_errors, e);
                     }
                     pool.release_medium(buf);
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }
+        }
+    }
+
+    // ARM-optimized packet header parsing
+    #[inline(always)]
+    fn parse_packet_header(packet: &[u8]) -> Option<(u32, u32)> {
+        if packet.len() < 8 {
+            return None;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // ARM handles unaligned loads efficiently
+            unsafe {
+                let ptr = packet.as_ptr();
+                let sender_id = (ptr as *const u32).read_unaligned().to_le();
+                let receiver_id = (ptr.add(4) as *const u32).read_unaligned().to_le();
+                Some((sender_id, receiver_id))
+            }
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let sender_id = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
+            let receiver_id = u32::from_le_bytes([packet[4], packet[5], packet[6], packet[7]]);
+            Some((sender_id, receiver_id))
         }
     }
 
@@ -289,14 +364,12 @@ impl TunnelV3 {
         let pool = buffer_pool::get_pool();
 
         for (buf, addr) in batch.drain(..) {
-            // Apply backpressure
             if !self.backpressure.increment_load() {
                 self.metrics.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 pool.release_medium(buf);
                 continue;
             }
 
-            // Try to acquire permit, skip if can't
             let permit = match self.task_limiter.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
@@ -312,17 +385,20 @@ impl TunnelV3 {
 
             tokio::spawn(async move {
                 let _permit = permit;
-
-                // Use RAII guard for guaranteed cleanup
                 let _guard = BackpressureGuard::new(self_clone.backpressure.clone());
-
                 self_clone.on_receive(buf, addr, socket_clone).await;
             });
         }
 
-        // Log batch processing metrics periodically
+        // Log metrics less frequently on ARM (better performance)
+        #[cfg(target_arch = "aarch64")]
+        const LOG_INTERVAL: u64 = 5000;
+
+        #[cfg(not(target_arch = "aarch64"))]
+        const LOG_INTERVAL: u64 = 1000;
+
         static BATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
-        if BATCH_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000 == 0 {
+        if BATCH_COUNTER.fetch_add(1, Ordering::Relaxed) % LOG_INTERVAL == 0 {
             debug!(
                 "Worker {} - Backpressure: {:.1}%, Dropped: {}",
                 worker_id,
@@ -339,19 +415,14 @@ impl TunnelV3 {
         socket: Arc<UdpSocket>,
     ) {
         let pool = buffer_pool::get_pool();
-
-        // Ensure buffer is always released
         let _buffer_guard = BufferReleaseGuard::new(packet.clone(), pool);
 
-        // Parse packet header
-        if packet.len() < 8 {
-            return;
-        }
+        // Use optimized header parsing
+        let (sender_id, receiver_id) = match Self::parse_packet_header(&packet) {
+            Some(ids) => ids,
+            None => return,
+        };
 
-        let sender_id = (&packet[..]).get_u32_le();
-        let receiver_id = (&packet[4..]).get_u32_le();
-
-        // Update metrics
         self.metrics.v3_packets_received.fetch_add(1, Ordering::Relaxed);
         self.metrics.v3_bytes_received.fetch_add(packet.len() as u64, Ordering::Relaxed);
 
@@ -361,7 +432,6 @@ impl TunnelV3 {
             return;
         }
 
-        // Validation
         if !self.validate_packet(sender_id, receiver_id, &remote_addr) {
             return;
         }
@@ -374,23 +444,19 @@ impl TunnelV3 {
             return;
         }
 
-        // Check maintenance mode
-        if self.maintenance_mode.load(Ordering::Acquire) {
+        if self.maintenance_mode.load(LOAD_ORDERING) {
             return;
         }
 
-        // Handle data forwarding with priority
         self.handle_data_forward_with_priority(sender_id, receiver_id, packet, remote_addr, socket).await;
     }
 
     #[inline(always)]
     fn validate_packet(&self, sender_id: u32, receiver_id: u32, addr: &SocketAddr) -> bool {
-        // Check for invalid combinations
         if sender_id == receiver_id && sender_id != 0 {
             return false;
         }
 
-        // Check for invalid addresses
         let ip_valid = match addr.ip() {
             IpAddr::V4(v4) => {
                 !v4.is_loopback() &&
@@ -416,7 +482,6 @@ impl TunnelV3 {
     ) {
         self.metrics.v3_ping_requests.fetch_add(1, Ordering::Relaxed);
 
-        // Send first 12 bytes back as response
         let response = &packet[..12.min(packet.len())];
 
         if let Err(e) = socket.send_to(response, remote_addr).await {
@@ -435,13 +500,11 @@ impl TunnelV3 {
         remote_addr: SocketAddr,
         socket: Arc<UdpSocket>,
     ) {
-        // Handle sender connection
         let sender_valid = if let Some(existing) = self.mappings.get(&sender_id) {
             let client = existing.clone();
 
             if let Some(ep) = client.remote_ep {
                 if ep != remote_addr {
-                    // IP changed, validate and update
                     if client.is_timed_out() {
                         if self.connection_limiter.update_ip(&ep.ip(), &remote_addr.ip()) {
                             drop(existing);
@@ -450,8 +513,6 @@ impl TunnelV3 {
                                 TIMEOUT_SECONDS,
                             ));
                             self.mappings.insert(sender_id, new_client.clone());
-
-                            // Initialize quality analyzer for new connection
                             self.quality_analyzers.insert(sender_id, QualityAnalyzer::new());
                             true
                         } else {
@@ -461,22 +522,18 @@ impl TunnelV3 {
                         false
                     }
                 } else {
-                    // Same IP, update stats
                     client.set_last_receive_tick();
                     client.update_stats(packet.len(), 0);
 
-                    // Update quality metrics
                     if let Some(mut analyzer) = self.quality_analyzers.get_mut(&sender_id) {
                         analyzer.record_packet(false);
                     }
-
                     true
                 }
             } else {
                 false
             }
         } else {
-            // New connection
             if self.mappings.len() < self.config.max_clients {
                 if self.connection_limiter.try_add(&remote_addr.ip()) {
                     let client = Arc::new(TunnelClient::new_with_endpoint(
@@ -485,7 +542,7 @@ impl TunnelV3 {
                     ));
                     self.mappings.insert(sender_id, client);
                     self.quality_analyzers.insert(sender_id, QualityAnalyzer::new());
-                    self.metrics.v3_active_clients.store(self.mappings.len(), Ordering::Relaxed);
+                    self.metrics.v3_active_clients.store(self.mappings.len(), STORE_ORDERING);
                     true
                 } else {
                     self.metrics.rate_limit_hits.fetch_add(1, Ordering::Relaxed);
@@ -501,30 +558,24 @@ impl TunnelV3 {
             return;
         }
 
-        // Forward to receiver with priority consideration
         if let Some(receiver) = self.mappings.get(&receiver_id) {
             if let Some(receiver_ep) = receiver.remote_ep {
                 if receiver_ep != remote_addr {
-                    // Check if receiver is a slow connection and prioritize
                     let is_priority = receiver.is_slow_connection();
 
                     if is_priority || self.backpressure.get_load_percentage() < 90.0 {
                         if let Err(e) = socket.send_to(&packet, receiver_ep).await {
                             debug!("Failed to forward packet to {}: {}", receiver_ep, e);
 
-                            // Update quality analyzer for packet loss
                             if let Some(mut analyzer) = self.quality_analyzers.get_mut(&receiver_id) {
                                 analyzer.record_packet(true);
                             }
                         } else {
                             self.metrics.v3_packets_sent.fetch_add(1, Ordering::Relaxed);
                             self.metrics.v3_bytes_sent.fetch_add(packet.len() as u64, Ordering::Relaxed);
-
-                            // Update receiver stats
                             receiver.update_stats(0, packet.len());
                         }
                     } else {
-                        // Under heavy load, drop packets for non-priority connections
                         self.metrics.dropped_packets.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -534,13 +585,13 @@ impl TunnelV3 {
 
     async fn execute_command(&self, packet: &[u8]) {
         let now = Instant::now().elapsed().as_secs();
-        let last = self.last_command_tick.load(Ordering::Acquire);
+        let last = self.last_command_tick.load(LOAD_ORDERING);
 
         if now.saturating_sub(last) < COMMAND_RATE_LIMIT || self.maintenance_password_sha1.is_none() {
             return;
         }
 
-        self.last_command_tick.store(now, Ordering::Release);
+        self.last_command_tick.store(now, STORE_ORDERING);
 
         let command = packet[8];
         let password_sha1 = &packet[9..29];
@@ -553,7 +604,6 @@ impl TunnelV3 {
                         info!("Maintenance mode toggled: {} -> {}", prev, !prev);
                     }
                     1 => {
-                        // Force cleanup command
                         info!("Forcing cleanup of expired connections");
                         self.cleanup_expired_mappings().await;
                     }
@@ -572,13 +622,11 @@ impl TunnelV3 {
         loop {
             interval.tick().await;
 
-            // Cleanup every 3rd interval
             cleanup_counter = cleanup_counter.wrapping_add(1);
             if cleanup_counter % 3 == 0 {
                 self.cleanup_expired_mappings().await;
             }
 
-            // Shrink buffer pools if needed
             if cleanup_counter % 10 == 0 {
                 buffer_pool::get_pool().shrink_pools();
             }
@@ -587,7 +635,6 @@ impl TunnelV3 {
                 self.send_master_announce().await;
             }
 
-            // Log metrics periodically
             if cleanup_counter % 5 == 0 {
                 self.log_metrics();
             }
@@ -596,9 +643,14 @@ impl TunnelV3 {
 
     async fn cleanup_expired_mappings(&self) {
         let mut expired = Vec::with_capacity(32);
+
+        // ARM: Process more entries per chunk due to better memory bandwidth
+        #[cfg(target_arch = "aarch64")]
+        const CHUNK_SIZE: usize = 200;
+
+        #[cfg(not(target_arch = "aarch64"))]
         const CHUNK_SIZE: usize = 100;
 
-        // Process entries in chunks to avoid holding locks too long
         let entries: Vec<_> = self.mappings.iter()
             .map(|entry| (*entry.key(), entry.value().clone()))
             .collect();
@@ -614,24 +666,21 @@ impl TunnelV3 {
                 }
             }
 
-            // Remove expired entries for this chunk
-            if expired.len() >= 100 {
+            if expired.len() >= CHUNK_SIZE {
                 for id in expired.drain(..) {
                     self.mappings.remove(&id);
                     self.quality_analyzers.remove(&id);
                 }
-                // Yield to other tasks
                 tokio::task::yield_now().await;
             }
         }
 
-        // Remove any remaining expired entries
         for id in expired {
             self.mappings.remove(&id);
             self.quality_analyzers.remove(&id);
         }
 
-        self.metrics.v3_active_clients.store(self.mappings.len(), Ordering::Relaxed);
+        self.metrics.v3_active_clients.store(self.mappings.len(), STORE_ORDERING);
         self.ping_limiter.reset();
 
         info!(
@@ -643,7 +692,7 @@ impl TunnelV3 {
 
     async fn send_master_announce(&self) {
         let clients = self.mappings.len();
-        let maintenance = if self.maintenance_mode.load(Ordering::Acquire) { "1" } else { "0" };
+        let maintenance = if self.maintenance_mode.load(LOAD_ORDERING) { "1" } else { "0" };
 
         let url = format!(
             "{}?version={}&name={}&port={}&clients={}&maxclients={}&masterpw={}&maintenance={}",

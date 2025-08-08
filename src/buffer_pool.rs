@@ -6,12 +6,15 @@ use std::sync::OnceLock;
 
 static GLOBAL_POOL: OnceLock<BufferPool> = OnceLock::new();
 
+// ARM cache line size is 64 bytes
+#[cfg(target_arch = "aarch64")]
+#[repr(align(64))]
 pub struct BufferPool {
     small: Mutex<VecDeque<BytesMut>>,  // 64 bytes
     medium: Mutex<VecDeque<BytesMut>>, // 1024 bytes
     large: Mutex<VecDeque<BytesMut>>,  // 8192 bytes
 
-    // Pool statistics for monitoring
+    // Pool statistics for monitoring - aligned for ARM
     small_hits: AtomicUsize,
     small_misses: AtomicUsize,
     medium_hits: AtomicUsize,
@@ -20,6 +23,22 @@ pub struct BufferPool {
     large_misses: AtomicUsize,
 
     // Track allocations for leak detection
+    small_allocated: AtomicUsize,
+    medium_allocated: AtomicUsize,
+    large_allocated: AtomicUsize,
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub struct BufferPool {
+    small: Mutex<VecDeque<BytesMut>>,
+    medium: Mutex<VecDeque<BytesMut>>,
+    large: Mutex<VecDeque<BytesMut>>,
+    small_hits: AtomicUsize,
+    small_misses: AtomicUsize,
+    medium_hits: AtomicUsize,
+    medium_misses: AtomicUsize,
+    large_hits: AtomicUsize,
+    large_misses: AtomicUsize,
     small_allocated: AtomicUsize,
     medium_allocated: AtomicUsize,
     large_allocated: AtomicUsize,
@@ -40,28 +59,48 @@ pub struct PoolStats {
 
 impl BufferPool {
     fn new() -> Self {
-        // Pre-allocate some buffers
-        let mut small_pool = VecDeque::with_capacity(1000);
-        let mut medium_pool = VecDeque::with_capacity(500);
-        let mut large_pool = VecDeque::with_capacity(100);
+        // ARM-optimized pool sizes
+        #[cfg(target_arch = "aarch64")]
+        let (small_cap, medium_cap, large_cap) = (2000, 1000, 200);
 
-        // Pre-fill pools for better startup performance
-        for _ in 0..100 {
-            let mut buf = BytesMut::with_capacity(64);
-            buf.resize(64, 0);
-            small_pool.push_back(buf);
+        #[cfg(not(target_arch = "aarch64"))]
+        let (small_cap, medium_cap, large_cap) = (1000, 500, 100);
+
+        let mut small_pool = VecDeque::with_capacity(small_cap);
+        let mut medium_pool = VecDeque::with_capacity(medium_cap);
+        let mut large_pool = VecDeque::with_capacity(large_cap);
+
+        // Pre-fill pools - more aggressive on ARM due to better memory bandwidth
+        #[cfg(target_arch = "aarch64")]
+        {
+            for _ in 0..200 {
+                small_pool.push_back(Self::create_zeroed_buffer(64));
+            }
+            for _ in 0..100 {
+                medium_pool.push_back(Self::create_zeroed_buffer(1024));
+            }
+            for _ in 0..20 {
+                large_pool.push_back(Self::create_zeroed_buffer(8192));
+            }
         }
 
-        for _ in 0..50 {
-            let mut buf = BytesMut::with_capacity(1024);
-            buf.resize(1024, 0);
-            medium_pool.push_back(buf);
-        }
-
-        for _ in 0..10 {
-            let mut buf = BytesMut::with_capacity(8192);
-            buf.resize(8192, 0);
-            large_pool.push_back(buf);
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for _ in 0..100 {
+                let mut buf = BytesMut::with_capacity(64);
+                buf.resize(64, 0);
+                small_pool.push_back(buf);
+            }
+            for _ in 0..50 {
+                let mut buf = BytesMut::with_capacity(1024);
+                buf.resize(1024, 0);
+                medium_pool.push_back(buf);
+            }
+            for _ in 0..10 {
+                let mut buf = BytesMut::with_capacity(8192);
+                buf.resize(8192, 0);
+                large_pool.push_back(buf);
+            }
         }
 
         Self {
@@ -74,9 +113,52 @@ impl BufferPool {
             medium_misses: AtomicUsize::new(0),
             large_hits: AtomicUsize::new(0),
             large_misses: AtomicUsize::new(0),
-            small_allocated: AtomicUsize::new(100),
-            medium_allocated: AtomicUsize::new(50),
-            large_allocated: AtomicUsize::new(10),
+            small_allocated: AtomicUsize::new(200),
+            medium_allocated: AtomicUsize::new(100),
+            large_allocated: AtomicUsize::new(20),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn create_zeroed_buffer(size: usize) -> BytesMut {
+        let mut buf = BytesMut::with_capacity(size);
+        buf.resize(size, 0);
+        Self::clear_buffer_neon(&mut buf);
+        buf
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn clear_buffer_neon(buf: &mut BytesMut) {
+        unsafe {
+            use std::arch::aarch64::*;
+
+            let ptr = buf.as_mut_ptr();
+            let len = buf.len();
+
+            // Use NEON for buffers >= 32 bytes
+            if len >= 32 {
+                let zero = vdupq_n_u8(0);
+                let mut offset = 0;
+
+                // Process 32 bytes at a time using NEON
+                while offset + 32 <= len {
+                    vst1q_u8(ptr.add(offset), zero);
+                    vst1q_u8(ptr.add(offset + 16), zero);
+                    offset += 32;
+                }
+
+                // Clear remaining bytes
+                for i in offset..len {
+                    *ptr.add(i) = 0;
+                }
+            } else {
+                // Small buffer, use normal clear
+                for i in 0..len {
+                    *ptr.add(i) = 0;
+                }
+            }
         }
     }
 
@@ -84,15 +166,28 @@ impl BufferPool {
         let mut pool = self.small.lock();
         if let Some(mut buf) = pool.pop_front() {
             self.small_hits.fetch_add(1, Ordering::Relaxed);
+
+            #[cfg(target_arch = "aarch64")]
+            Self::clear_buffer_neon(&mut buf);
+
+            #[cfg(not(target_arch = "aarch64"))]
             buf.clear();
+
             buf.resize(64, 0);
             buf
         } else {
             self.small_misses.fetch_add(1, Ordering::Relaxed);
             self.small_allocated.fetch_add(1, Ordering::Relaxed);
-            let mut buf = BytesMut::with_capacity(64);
-            buf.resize(64, 0);
-            buf
+
+            #[cfg(target_arch = "aarch64")]
+            return Self::create_zeroed_buffer(64);
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut buf = BytesMut::with_capacity(64);
+                buf.resize(64, 0);
+                buf
+            }
         }
     }
 
@@ -100,15 +195,28 @@ impl BufferPool {
         let mut pool = self.medium.lock();
         if let Some(mut buf) = pool.pop_front() {
             self.medium_hits.fetch_add(1, Ordering::Relaxed);
+
+            #[cfg(target_arch = "aarch64")]
+            Self::clear_buffer_neon(&mut buf);
+
+            #[cfg(not(target_arch = "aarch64"))]
             buf.clear();
+
             buf.resize(1024, 0);
             buf
         } else {
             self.medium_misses.fetch_add(1, Ordering::Relaxed);
             self.medium_allocated.fetch_add(1, Ordering::Relaxed);
-            let mut buf = BytesMut::with_capacity(1024);
-            buf.resize(1024, 0);
-            buf
+
+            #[cfg(target_arch = "aarch64")]
+            return Self::create_zeroed_buffer(1024);
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut buf = BytesMut::with_capacity(1024);
+                buf.resize(1024, 0);
+                buf
+            }
         }
     }
 
@@ -116,67 +224,123 @@ impl BufferPool {
         let mut pool = self.large.lock();
         if let Some(mut buf) = pool.pop_front() {
             self.large_hits.fetch_add(1, Ordering::Relaxed);
+
+            #[cfg(target_arch = "aarch64")]
+            Self::clear_buffer_neon(&mut buf);
+
+            #[cfg(not(target_arch = "aarch64"))]
             buf.clear();
+
             buf.resize(8192, 0);
             buf
         } else {
             self.large_misses.fetch_add(1, Ordering::Relaxed);
             self.large_allocated.fetch_add(1, Ordering::Relaxed);
-            let mut buf = BytesMut::with_capacity(8192);
-            buf.resize(8192, 0);
-            buf
+
+            #[cfg(target_arch = "aarch64")]
+            return Self::create_zeroed_buffer(8192);
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut buf = BytesMut::with_capacity(8192);
+                buf.resize(8192, 0);
+                buf
+            }
         }
     }
 
     pub fn release_small(&self, mut buf: BytesMut) {
-        // Validate buffer size to prevent wrong pool usage
         if buf.capacity() >= 32 && buf.capacity() <= 128 {
-            buf.clear();
-            buf.resize(64, 0); // Reset to standard size
+            // ARM-optimized: clear using NEON before returning to pool
+            #[cfg(target_arch = "aarch64")]
+            {
+                buf.clear();
+                buf.resize(64, 0);
+                Self::clear_buffer_neon(&mut buf);
+            }
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                buf.clear();
+                buf.resize(64, 0);
+            }
 
             let mut pool = self.small.lock();
-            if pool.len() < 1000 {
+
+            #[cfg(target_arch = "aarch64")]
+            let max_pool_size = 2000;
+
+            #[cfg(not(target_arch = "aarch64"))]
+            let max_pool_size = 1000;
+
+            if pool.len() < max_pool_size {
                 pool.push_back(buf);
             } else {
-                // Pool is full, let buffer deallocate
                 self.small_allocated.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        // Wrong size buffer, let it deallocate
     }
 
     pub fn release_medium(&self, mut buf: BytesMut) {
-        // Validate buffer size to prevent wrong pool usage
         if buf.capacity() >= 512 && buf.capacity() <= 2048 {
-            buf.clear();
-            buf.resize(1024, 0); // Reset to standard size
+            #[cfg(target_arch = "aarch64")]
+            {
+                buf.clear();
+                buf.resize(1024, 0);
+                Self::clear_buffer_neon(&mut buf);
+            }
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                buf.clear();
+                buf.resize(1024, 0);
+            }
 
             let mut pool = self.medium.lock();
-            if pool.len() < 500 {
+
+            #[cfg(target_arch = "aarch64")]
+            let max_pool_size = 1000;
+
+            #[cfg(not(target_arch = "aarch64"))]
+            let max_pool_size = 500;
+
+            if pool.len() < max_pool_size {
                 pool.push_back(buf);
             } else {
-                // Pool is full, let buffer deallocate
                 self.medium_allocated.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        // Wrong size buffer, let it deallocate
     }
 
     pub fn release_large(&self, mut buf: BytesMut) {
-        // Validate buffer size to prevent wrong pool usage
         if buf.capacity() >= 4096 && buf.capacity() <= 16384 {
-            buf.clear();
-            buf.resize(8192, 0); // Reset to standard size
+            #[cfg(target_arch = "aarch64")]
+            {
+                buf.clear();
+                buf.resize(8192, 0);
+                Self::clear_buffer_neon(&mut buf);
+            }
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                buf.clear();
+                buf.resize(8192, 0);
+            }
 
             let mut pool = self.large.lock();
-            if pool.len() < 100 {
+
+            #[cfg(target_arch = "aarch64")]
+            let max_pool_size = 200;
+
+            #[cfg(not(target_arch = "aarch64"))]
+            let max_pool_size = 100;
+
+            if pool.len() < max_pool_size {
                 pool.push_back(buf);
             } else {
-                // Pool is full, let buffer deallocate
                 self.large_allocated.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        // Wrong size buffer, let it deallocate
     }
 
     pub fn get_stats(&self) -> PoolStats {
@@ -216,27 +380,43 @@ impl BufferPool {
     }
 
     pub fn clear_pools(&self) {
-        // Clear all pools (useful for testing or shutdown)
         self.small.lock().clear();
         self.medium.lock().clear();
         self.large.lock().clear();
     }
 
     pub fn shrink_pools(&self) {
-        // Shrink pools to 50% if they're too full (memory optimization)
+        // ARM can handle larger pools due to better memory subsystem
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut small = self.small.lock();
+            if small.len() > 1000 {
+                small.truncate(1000);
+            }
+
+            let mut medium = self.medium.lock();
+            if medium.len() > 500 {
+                medium.truncate(500);
+            }
+
+            let mut large = self.large.lock();
+            if large.len() > 100 {
+                large.truncate(100);
+            }
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
         {
             let mut small = self.small.lock();
             if small.len() > 500 {
                 small.truncate(500);
             }
-        }
-        {
+
             let mut medium = self.medium.lock();
             if medium.len() > 250 {
                 medium.truncate(250);
             }
-        }
-        {
+
             let mut large = self.large.lock();
             if large.len() > 50 {
                 large.truncate(50);
@@ -247,6 +427,11 @@ impl BufferPool {
 
 pub fn init_global_pool() {
     GLOBAL_POOL.get_or_init(|| BufferPool::new());
+
+    #[cfg(target_arch = "aarch64")]
+    tracing::info!("Buffer pool initialized with ARM NEON optimizations");
+
+    #[cfg(not(target_arch = "aarch64"))]
     tracing::info!("Buffer pool initialized with pre-allocated buffers");
 }
 
@@ -315,11 +500,18 @@ impl Drop for BufferGuard {
     }
 }
 
-// Periodic maintenance task
+// Periodic maintenance task with ARM-specific tuning
 pub async fn maintenance_task() {
     use tokio::time::{interval, Duration};
 
-    let mut interval = interval(Duration::from_secs(60));
+    // ARM can handle more frequent maintenance due to efficient atomics
+    #[cfg(target_arch = "aarch64")]
+    let maintenance_interval = Duration::from_secs(30);
+
+    #[cfg(not(target_arch = "aarch64"))]
+    let maintenance_interval = Duration::from_secs(60);
+
+    let mut interval = interval(maintenance_interval);
 
     loop {
         interval.tick().await;
@@ -327,18 +519,29 @@ pub async fn maintenance_task() {
         let pool = get_pool();
         let stats = pool.get_stats();
 
-        // Shrink pools if hit rate is too high (meaning we have too many buffers)
-        if stats.medium_hit_rate > 95.0 {
+        // ARM-specific: more aggressive shrinking threshold
+        #[cfg(target_arch = "aarch64")]
+        let shrink_threshold = 98.0;
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let shrink_threshold = 95.0;
+
+        if stats.medium_hit_rate > shrink_threshold {
             pool.shrink_pools();
             tracing::debug!("Shrinking buffer pools due to high hit rate");
         }
 
-        // Log statistics periodically
         tracing::debug!(
-            "Buffer pool stats - Small: {:.1}% hit rate, Medium: {:.1}% hit rate, Large: {:.1}% hit rate",
+            "Buffer pool stats - Small: {:.1}% hit rate ({}/{}), Medium: {:.1}% hit rate ({}/{}), Large: {:.1}% hit rate ({}/{})",
             stats.small_hit_rate,
+            stats.small_pooled,
+            stats.small_allocated,
             stats.medium_hit_rate,
-            stats.large_hit_rate
+            stats.medium_pooled,
+            stats.medium_allocated,
+            stats.large_hit_rate,
+            stats.large_pooled,
+            stats.large_allocated
         );
     }
 }

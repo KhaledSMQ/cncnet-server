@@ -18,6 +18,14 @@ use tokio::signal;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
+// ARM-specific optimized allocator
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -67,20 +75,70 @@ struct Args {
     log_format: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
+    // ARM-specific runtime configuration
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+
+    // Optimize for ARM architecture
+    #[cfg(target_arch = "aarch64")]
+    {
+        // For t4g.medium with 2 vCPUs
+        let worker_threads = if args.workers > 0 {
+            args.workers
+        } else {
+            // Default to number of CPUs for ARM
+            num_cpus::get().min(4)
+        };
+
+        builder.worker_threads(worker_threads);
+        builder.max_blocking_threads(worker_threads * 2);
+        builder.thread_stack_size(2 * 1024 * 1024); // 2MB stack for ARM
+
+        // Set thread names for debugging
+        builder.thread_name("cncnet-worker");
+
+        info!("Configured for ARM with {} worker threads", worker_threads);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        if args.workers > 0 {
+            builder.worker_threads(args.workers);
+        }
+    }
+
+    let runtime = builder
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> Result<()> {
     // Initialize tracing with configurable format
     init_tracing(&args.log_level, &args.log_format)?;
 
     info!("Starting CnCNet Server v2.0.0 - Production Edition");
+
+    // Log ARM-specific information
+    #[cfg(target_arch = "aarch64")]
+    {
+        info!("Running on ARM64 architecture (optimized for AWS Graviton2)");
+        if let Ok(contents) = std::fs::read_to_string("/proc/cpuinfo") {
+            if contents.contains("Neoverse") {
+                info!("Detected AWS Graviton processor - optimizations enabled");
+            }
+        }
+    }
+
     info!("Configuration loaded from CLI args and environment");
 
     // Validate and create config
     let config = Arc::new(config::ServerConfig::from_args(args)?);
 
-    // Initialize global buffer pool
+    // Initialize global buffer pool with ARM optimizations
     buffer_pool::init_global_pool();
 
     // Initialize metrics
@@ -89,8 +147,14 @@ async fn main() -> Result<()> {
     // Create shutdown coordinator
     let shutdown = shutdown::ShutdownCoordinator::new();
 
-    // Create task semaphore to prevent unbounded spawning
-    let task_limiter = Arc::new(Semaphore::new(10000));
+    // Create task semaphore - adjust for ARM's efficiency
+    #[cfg(target_arch = "aarch64")]
+    let max_concurrent_tasks = 5000; // ARM handles context switching well
+
+    #[cfg(not(target_arch = "aarch64"))]
+    let max_concurrent_tasks = 10000;
+
+    let task_limiter = Arc::new(Semaphore::new(max_concurrent_tasks));
 
     // Start health check server
     let health_handle = health::start_health_server(
@@ -98,6 +162,10 @@ async fn main() -> Result<()> {
         metrics.clone(),
         shutdown.subscribe(),
     );
+
+    // Apply system optimizations for ARM
+    #[cfg(target_arch = "aarch64")]
+    apply_arm_optimizations();
 
     // Start services
     let mut service_handles = Vec::new();
@@ -273,4 +341,29 @@ async fn shutdown_handler(coordinator: shutdown::ShutdownCoordinator) -> Result<
     }
 
     Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn apply_arm_optimizations() {
+    use std::process::Command;
+
+    // Try to set CPU governor to performance mode
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor")
+        .output();
+
+    // Enable RPS (Receive Packet Steering) for better packet distribution
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("echo 3 | sudo tee /sys/class/net/*/queues/rx-*/rps_cpus")
+        .output();
+
+    // Set affinity for interrupts
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("echo 2 | sudo tee /proc/irq/*/smp_affinity")
+        .output();
+
+    info!("Applied ARM-specific system optimizations");
 }

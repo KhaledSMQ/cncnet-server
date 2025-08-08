@@ -9,96 +9,95 @@ keywords = ["cncnet", "gaming", "tunnel", "server", "networking"]
 categories = ["network-programming", "game-development"]
 license = "MIT"
 
-[dependencies]
-# Async runtime
-tokio = { version = "1.40", features = ["full"] }
-tokio-util = "0.7"
+[profile.release]
+# ARM-optimized release profile for AWS Graviton2
+opt-level = 3
+lto = "fat"  # Better for ARM's instruction pipeline
+codegen-units = 1
+strip = true
+panic = "abort"
+overflow-checks = false
+debug = false
+# Inline more aggressively on ARM
+inline-threshold = 275
 
-# Networking
-bytes = "1.7"
-socket2 = { version = "0.6", features = ["all"] }
-hyper = { version = "1.4", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["server", "http1"] }
-http-body-util = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+[profile.release-arm]
+inherits = "release"
+# Even more aggressive ARM optimizations
+lto = "fat"
+opt-level = 3
+codegen-units = 1
+
+[dependencies]
+# Core async runtime - optimized for ARM
+tokio = { version = "1.40", features = [
+    "full",
+    "parking_lot", # Better performance on ARM
+] }
 rater = "0.1.1"
 
-# Data structures
-dashmap = "6.1"
-parking_lot = "0.12"
-crossbeam-channel = "0.5"
-crossbeam-queue = "0.3"
-ahash = "0.8"
-arc-swap = "1.7"
+# Network and HTTP
+hyper = { version = "1.5", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "http1"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls", # Better than OpenSSL on ARM
+    "http2",
+    "gzip",
+    "brotli"
+] }
+socket2 = { version = "0.6", features = ["all"] }
 
-# Utilities
-clap = { version = "4.5", features = ["derive", "env"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
-num_cpus = "1.17"
+# Data structures optimized for ARM
+dashmap = { version = "6.1", features = ["rayon"] }
+bytes = "1.8"
+parking_lot = "0.12"  # Faster than std::sync on ARM
+
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha1 = "0.10"
-urlencoding = "2.1"
-rand = "0.9"
-chrono = "0.4"
+
+# Utilities
 anyhow = "1.0"
 thiserror = "2.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
+urlencoding = "2.1"
+sha1 = "0.10"
+rand = { version = "0.9", features = ["small_rng"] }  # Faster on ARM
+chrono = "0.4"
+num_cpus = "1.16"
 futures = "0.3"
 
 # Metrics
-prometheus = "0.14"
+prometheus = "0.13"
 
-# System libraries (for optimizations)
+# For libc calls (ARM optimizations)
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-# Optional: for better async performance
-mio = { version = "1.0", features = ["os-poll", "net"] }
+# ARM-optimized allocator
+[target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads", "stats"] }
 
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["socket", "net"] }
 
 [dev-dependencies]
-criterion = "0.7"
+criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.5"
 tokio-test = "0.4"
 
-[profile.release]
-opt-level = 3           # Maximum optimization
-lto = "fat"             # Link-time optimization
-codegen-units = 1       # Single codegen unit for better optimization
-strip = true            # Strip symbols
-panic = "abort"         # Smaller binary, faster panics
-debug = false           # No debug info
-overflow-checks = false # Disable overflow checks for performance
-incremental = false     # Better optimization
-
-[profile.release-with-debug]
-inherits = "release"
-strip = false
-debug = true
-
-[profile.bench]
-inherits = "release"
-
-# For development with reasonable performance
-[profile.dev]
-opt-level = 1
-debug = true
-
-# For profiling
-[profile.profiling]
-inherits = "release"
-strip = false
-debug = true
+[build-dependencies]
+cc = "1.1"
 
 [[bin]]
 name = "cncnet-server"
 path = "src/main.rs"
 
-[features]
-default = []
-# Optional feature for io_uring support on Linux
-io-uring = []
-# Optional feature for extended metrics
-extended-metrics = []
+# Platform-specific build settings
+[target.'cfg(target_arch = "aarch64")']
+rustflags = [
+    "-C", "target-cpu=neoverse-n1", # AWS Graviton2 CPU
+    "-C", "link-arg=-fuse-ld=lld", # Faster linker
+    "-C", "target-feature=+crc,+aes,+sha2,+fp16,+rcpc,+dotprod,+crypto"
+]

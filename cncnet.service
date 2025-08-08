@@ -1,0 +1,70 @@
+[Unit]
+Description=CnCNet Game Server (ARM Optimized)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cncnet
+Group=cncnet
+WorkingDirectory=/opt/cncnet
+
+# ARM-specific environment variables
+Environment="RUST_LOG=info"
+Environment="RUST_BACKTRACE=1"
+Environment="TOKIO_WORKER_THREADS=2"
+
+# Jemalloc configuration for ARM
+Environment="LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2"
+Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:10000,lg_extent_max_active_fit:3"
+
+# Memory and CPU limits for t4g.medium (4GB RAM, 2 vCPUs)
+MemoryMax=3.5G
+MemoryHigh=3G
+CPUQuota=190%
+TasksMax=4096
+
+# IO and Network priority
+IOWeight=100
+IPAccounting=true
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cncnet/logs
+
+# Performance tuning
+LimitNOFILE=1048576
+LimitNPROC=32768
+LimitMEMLOCK=infinity
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitBurst=3
+StartLimitInterval=60
+
+# Main process
+ExecStartPre=/bin/bash -c 'echo "Starting CnCNet server on ARM Graviton2"'
+ExecStart=/opt/cncnet/cncnet-server \
+    --port 50001 \
+    --portv2 50000 \
+    --name "CnCNet ARM Server" \
+    --maxclients 200 \
+    --iplimit 8 \
+    --iplimitv2 4 \
+    --workers 2 \
+    --metrics-port 9090 \
+    --log-level info
+
+ExecReload=/bin/kill -USR1 $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+
+# Enable core dumps for debugging
+LimitCORE=infinity
+WorkingDirectory=/opt/cncnet
+
+[Install]
+WantedBy=multi-user.target
