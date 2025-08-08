@@ -220,7 +220,8 @@ Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_
 # Resource limits for t4g.medium
 MemoryMax=3.5G
 MemoryHigh=3G
-CPUQuota=190%
+CPUQuota=200%
+CPUAffinity=0 1
 TasksMax=4096
 
 # Performance
