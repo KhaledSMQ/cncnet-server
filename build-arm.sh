@@ -73,8 +73,6 @@ if [[ "$AL_VERSION" == "2023" ]]; then
         lld \
         clang \
         jemalloc-devel \
-        curl \
-        git \
         perf
 else
     # Amazon Linux 2
@@ -87,8 +85,6 @@ else
         openssl-devel \
         pkgconfig \
         clang \
-        curl \
-        git \
         perf
 
     # Install jemalloc from source on AL2 (not in default repos)
