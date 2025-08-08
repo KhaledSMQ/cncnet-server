@@ -36,18 +36,30 @@ fn create_dashmap_with_capacity<K, V>(capacity: usize) -> DashMap<K, V>
 where
     K: Eq + std::hash::Hash,
 {
-    // Ensure we have at least 2 shards (DashMap requirement)
-    // Use power of 2 for better performance
-    let num_cpus = num_cpus::get().max(2);
-    let shard_amount = if num_cpus <= 2 {
-        4  // Minimum 4 shards for safety
-    } else if num_cpus <= 4 {
+    // Get number of CPUs, ensuring minimum of 1
+    let detected_cpus = num_cpus::get();
+
+    // Calculate shard amount based on CPU count
+    // IMPORTANT: DashMap requires shard_amount > 1 (minimum is 2)
+    let shard_amount = if detected_cpus <= 1 {
+        2  // Minimum required by DashMap
+    } else if detected_cpus <= 2 {
+        4  // Use 4 shards for 2 CPUs
+    } else if detected_cpus <= 4 {
         8
-    } else if num_cpus <= 8 {
+    } else if detected_cpus <= 8 {
         16
     } else {
         32
     };
+
+    // Log the configuration for debugging
+    tracing::debug!(
+        "Creating DashMap with {} shards for {} CPUs (capacity: {})",
+        shard_amount,
+        detected_cpus,
+        capacity
+    );
 
     DashMap::with_capacity_and_shard_amount(capacity, shard_amount)
 }
