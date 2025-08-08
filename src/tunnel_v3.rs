@@ -46,6 +46,27 @@ const LOAD_ORDERING: Ordering = Ordering::SeqCst;
 #[cfg(not(target_arch = "aarch64"))]
 const STORE_ORDERING: Ordering = Ordering::SeqCst;
 
+// Helper function to create DashMap with proper shard count
+fn create_dashmap_with_capacity<K, V>(capacity: usize) -> DashMap<K, V>
+where
+    K: Eq + std::hash::Hash,
+{
+    // Ensure we have at least 2 shards (DashMap requirement)
+    // Use power of 2 for better performance
+    let num_cpus = num_cpus::get().max(2);
+    let shard_amount = if num_cpus <= 2 {
+        4  // Minimum 4 shards for safety
+    } else if num_cpus <= 4 {
+        8
+    } else if num_cpus <= 8 {
+        16
+    } else {
+        32
+    };
+
+    DashMap::with_capacity_and_shard_amount(capacity, shard_amount)
+}
+
 // Backpressure controller with ARM optimizations
 pub struct BackpressureController {
     current_load: AtomicU64,
@@ -155,9 +176,9 @@ impl TunnelV3 {
         Self {
             connection_limiter: Arc::new(ConnectionLimiter::new(config.ip_limit)),
             ping_limiter: Arc::new(RateLimiter::new(60, MAX_PINGS_PER_IP, MAX_PINGS_GLOBAL)),
-            mappings: Arc::new(DashMap::with_capacity(config.max_clients)),
+            mappings: Arc::new(create_dashmap_with_capacity(config.max_clients)),
             backpressure: Arc::new(BackpressureController::new(max_backpressure)),
-            quality_analyzers: Arc::new(DashMap::with_capacity(config.max_clients)),
+            quality_analyzers: Arc::new(create_dashmap_with_capacity(config.max_clients)),
             config,
             metrics,
             maintenance_mode: Arc::new(AtomicBool::new(false)),
@@ -226,7 +247,6 @@ impl TunnelV3 {
                 use libc::{c_int, c_void, setsockopt, SOL_SOCKET};
 
                 const SO_REUSEPORT: c_int = 15;
-                const SO_ATTACH_REUSEPORT_CBPF: c_int = 51;
 
                 let optval: c_int = 1;
                 unsafe {
@@ -267,18 +287,6 @@ impl TunnelV3 {
         let mut receive_errors = 0u32;
 
         info!("Worker {} started (ARM optimized)", worker_id);
-
-        // ARM: Pin worker to specific CPU for better cache locality
-        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-        {
-            use std::process::Command;
-            let cpu = worker_id % num_cpus::get();
-            let _ = Command::new("taskset")
-                .arg("-cp")
-                .arg(cpu.to_string())
-                .arg(std::process::id().to_string())
-                .output();
-        }
 
         loop {
             if !self.backpressure.should_accept() {

@@ -72,6 +72,7 @@ futures = "0.3"
 
 # Metrics
 prometheus = "0.13"
+libc = "0.2.174"
 
 # For libc calls (ARM optimizations)
 [target.'cfg(target_os = "linux")'.dependencies]

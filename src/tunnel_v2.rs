@@ -31,6 +31,27 @@ const TIMEOUT_SECONDS: u64 = 30;
 const MAX_HTTP_CONNECTIONS: usize = 100;
 const MAX_PACKET_SIZE: usize = 1472;
 
+// Helper function to create DashMap with proper shard count
+fn create_dashmap_with_capacity<K, V>(capacity: usize) -> DashMap<K, V>
+where
+    K: Eq + std::hash::Hash,
+{
+    // Ensure we have at least 2 shards (DashMap requirement)
+    // Use power of 2 for better performance
+    let num_cpus = num_cpus::get().max(2);
+    let shard_amount = if num_cpus <= 2 {
+        4  // Minimum 4 shards for safety
+    } else if num_cpus <= 4 {
+        8
+    } else if num_cpus <= 8 {
+        16
+    } else {
+        32
+    };
+
+    DashMap::with_capacity_and_shard_amount(capacity, shard_amount)
+}
+
 #[derive(Clone)]
 pub struct TunnelV2 {
     config: SharedConfig,
@@ -55,7 +76,7 @@ impl TunnelV2 {
                 config.ip_limit_v2,
                 MAX_REQUESTS_GLOBAL,
             )),
-            mappings: Arc::new(DashMap::with_capacity(config.max_clients)),
+            mappings: Arc::new(create_dashmap_with_capacity(config.max_clients)),
             http_semaphore: Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS)),
             config,
             metrics,
