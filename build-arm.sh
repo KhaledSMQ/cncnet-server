@@ -342,16 +342,16 @@ if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
 fi
 
 # Configure firewall (if firewalld is installed)
-if command -v firewall-cmd &> /dev/null; then
-    echo -e "${GREEN}Configuring firewall...${NC}"
-    sudo firewall-cmd --permanent --add-port=50000/tcp
-    sudo firewall-cmd --permanent --add-port=50000/udp
-    sudo firewall-cmd --permanent --add-port=50001/udp
-    sudo firewall-cmd --permanent --add-port=8054/udp
-    sudo firewall-cmd --permanent --add-port=3478/udp
-    sudo firewall-cmd --permanent --add-port=9090/tcp
-    sudo firewall-cmd --reload
-fi
+#if command -v firewall-cmd &> /dev/null; then
+#    echo -e "${GREEN}Configuring firewall...${NC}"
+#    sudo firewall-cmd --permanent --add-port=50000/tcp
+#    sudo firewall-cmd --permanent --add-port=50000/udp
+#    sudo firewall-cmd --permanent --add-port=50001/udp
+#    sudo firewall-cmd --permanent --add-port=8054/udp
+#    sudo firewall-cmd --permanent --add-port=3478/udp
+#    sudo firewall-cmd --permanent --add-port=9090/tcp
+#    sudo firewall-cmd --reload
+#fi
 
 # Configure iptables (if no firewalld)
 #if ! command -v firewall-cmd &> /dev/null && command -v iptables &> /dev/null; then
