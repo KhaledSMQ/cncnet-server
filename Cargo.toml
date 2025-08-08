@@ -1,0 +1,104 @@
+[package]
+name = "cncnet-server"
+version = "2.0.0"
+edition = "2021"
+authors = ["Khaled Sameer <khaled.smq@hotmail.com>"]
+description = "High-performance CnCNet tunnel server for Red Alert 2 and Yuri's Revenge"
+repository = "https://github.com/khaledsmq/cncnet-server"
+keywords = ["cncnet", "gaming", "tunnel", "server", "networking"]
+categories = ["network-programming", "game-development"]
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7"
+
+# Networking
+bytes = "1.7"
+socket2 = { version = "0.6", features = ["all"] }
+hyper = { version = "1.4", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "http1"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rater = "0.1.1"
+
+# Data structures
+dashmap = "6.1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+ahash = "0.8"
+arc-swap = "1.7"
+
+# Utilities
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+num_cpus = "1.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+urlencoding = "2.1"
+rand = "0.9"
+chrono = "0.4"
+anyhow = "1.0"
+thiserror = "2.0"
+futures = "0.3"
+
+# Metrics
+prometheus = "0.14"
+
+# System libraries (for optimizations)
+libc = "0.2"
+
+# Optional: for better async performance
+mio = { version = "1.0", features = ["os-poll", "net"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["socket", "net"] }
+
+[dev-dependencies]
+criterion = "0.7"
+proptest = "1.5"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3           # Maximum optimization
+lto = "fat"             # Link-time optimization
+codegen-units = 1       # Single codegen unit for better optimization
+strip = true            # Strip symbols
+panic = "abort"         # Smaller binary, faster panics
+debug = false           # No debug info
+overflow-checks = false # Disable overflow checks for performance
+incremental = false     # Better optimization
+
+[profile.release-with-debug]
+inherits = "release"
+strip = false
+debug = true
+
+[profile.bench]
+inherits = "release"
+
+# For development with reasonable performance
+[profile.dev]
+opt-level = 1
+debug = true
+
+# For profiling
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true
+
+[[bin]]
+name = "cncnet-server"
+path = "src/main.rs"
+
+[features]
+default = []
+# Optional feature for io_uring support on Linux
+io-uring = []
+# Optional feature for extended metrics
+extended-metrics = []
