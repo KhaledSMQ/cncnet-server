@@ -1,502 +1,1083 @@
 #!/bin/bash
-# Build and deployment script for CnCNet server on ARM64/AWS Graviton2
-# For Amazon Linux 2/2023 on t4g.medium
 
-set -e
+# CnCNet Server AWS ARM64 Build and Deployment Script
+# Author: Khaled Sameer <khaled.smq@hotmail.com>
+# Repository: https://github.com/khaledsmq/cncnet-server
+# Description: Complete setup script for fresh AWS Linux ARM64 instance
 
-# Colors for output
+set -euo pipefail
+
+# Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Configuration
+# Configuration variables
+REPO_URL="https://github.com/khaledsmq/cncnet-server"
 PROJECT_NAME="cncnet-server"
-INSTALL_DIR="/opt/cncnet"
-SERVICE_NAME="cncnet"
-BUILD_TYPE="${1:-release}"
+SERVICE_USER="cncnet"
+INSTALL_DIR="/opt/cncnet-server"
+LOG_DIR="/var/log/cncnet-server"
+CONFIG_DIR="/etc/cncnet-server"
+SYSTEMD_SERVICE="cncnet-server.service"
 
-echo -e "${GREEN}=== CnCNet Server ARM Build Script (Amazon Linux) ===${NC}"
+# Rust configuration
+RUST_VERSION="stable"
+CARGO_TARGET="aarch64-unknown-linux-gnu"
 
-# Detect Amazon Linux version
-if [[ -f /etc/system-release ]]; then
-    if grep -q "Amazon Linux 2023" /etc/system-release; then
-        AL_VERSION="2023"
-        PKG_MANAGER="dnf"
-        echo -e "${GREEN}Detected Amazon Linux 2023${NC}"
-    elif grep -q "Amazon Linux 2" /etc/system-release; then
-        AL_VERSION="2"
-        PKG_MANAGER="yum"
-        echo -e "${GREEN}Detected Amazon Linux 2${NC}"
-    else
-        AL_VERSION="unknown"
-        PKG_MANAGER="yum"
-        echo -e "${YELLOW}Unknown Amazon Linux version${NC}"
-    fi
-else
-    echo -e "${YELLOW}Not running on Amazon Linux${NC}"
-    PKG_MANAGER="yum"
-fi
+# Network ports
+V3_PORT="${V3_PORT:-50001}"
+V2_PORT="${V2_PORT:-50000}"
+P2P_PORT1="${P2P_PORT1:-8054}"
+P2P_PORT2="${P2P_PORT2:-3478}"
 
-# Check if running on ARM64
-if [[ $(uname -m) != "aarch64" ]]; then
-    echo -e "${YELLOW}Warning: Not running on ARM64 architecture ($(uname -m))${NC}"
-    read -p "Continue anyway? (y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+# Server configuration
+SERVER_NAME="${SERVER_NAME:-CnCNet Server}"
+MASTER_URL="${MASTER_URL:-http://cncnet.org/master-announce}"
+NO_MASTER="${NO_MASTER:-false}"
+MAINT_PASSWORD="${MAINT_PASSWORD:-$(openssl rand -base64 12)}"
+
+# Performance tuning defaults
+MAX_CLIENTS="${MAX_CLIENTS:-200}"
+IP_LIMIT_V3="${IP_LIMIT_V3:-8}"
+IP_LIMIT_V2="${IP_LIMIT_V2:-4}"
+
+# Logging configuration
+LOG_LEVEL="${LOG_LEVEL:-info}"
+
+# Installation mode
+FORCE_REINSTALL="${FORCE_REINSTALL:-false}"
+
+# Logging functions - ALWAYS output to stderr
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1" >&2
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1" >&2
+}
+
+# Function to escape strings for systemd
+escape_systemd_string() {
+    local input="$1"
+    # Escape backslashes first, then double quotes
+    echo "$input" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g'
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root"
         exit 1
     fi
-fi
+}
 
-# Check for AWS Graviton2
-if [[ -f /proc/cpuinfo ]] && grep -q "Neoverse" /proc/cpuinfo; then
-    echo -e "${GREEN}✓ Detected AWS Graviton processor${NC}"
-    GRAVITON=true
-else
-    echo -e "${YELLOW}! Not running on AWS Graviton${NC}"
-    GRAVITON=false
-fi
+# Check for existing installation
+check_existing_installation() {
+    log_info "Checking for existing installation..."
 
-# Install dependencies based on Amazon Linux version
-echo -e "${GREEN}Installing build dependencies...${NC}"
+    local has_existing=false
 
-if [[ "$AL_VERSION" == "2023" ]]; then
-    # Amazon Linux 2023
-    sudo dnf update -y
-    sudo dnf groupinstall -y "Development Tools"
-    sudo dnf install -y \
-        gcc \
-        gcc-c++ \
-        make \
-        openssl-devel \
-        pkg-config \
-        lld \
-        clang \
-        jemalloc-devel \
-        curl \
-        git \
-        perf
-else
-    # Amazon Linux 2
-    sudo yum update -y
-    sudo yum groupinstall -y "Development Tools"
-    sudo yum install -y \
-        gcc \
-        gcc-c++ \
-        make \
-        openssl-devel \
-        pkgconfig \
-        clang \
-        curl \
-        git \
-        perf
-
-    # Install jemalloc from source on AL2 (not in default repos)
-    if ! ldconfig -p | grep -q jemalloc; then
-        echo -e "${GREEN}Building jemalloc from source...${NC}"
-        cd /tmp
-        wget https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2
-        tar -xjf jemalloc-5.3.0.tar.bz2
-        cd jemalloc-5.3.0
-        ./configure --prefix=/usr/local
-        make -j$(nproc)
-        sudo make install
-        sudo ldconfig
-        cd -
-        rm -rf /tmp/jemalloc*
+    if [[ -f /etc/systemd/system/$SYSTEMD_SERVICE ]]; then
+        log_warn "Found existing systemd service: $SYSTEMD_SERVICE"
+        has_existing=true
     fi
-fi
 
-# Install LLD if not available
-if ! command -v lld &> /dev/null; then
-    echo -e "${GREEN}Installing LLD...${NC}"
-    if [[ "$AL_VERSION" == "2023" ]]; then
-        sudo dnf install -y lld
+    if [[ -d $INSTALL_DIR && -f $INSTALL_DIR/$PROJECT_NAME ]]; then
+        log_warn "Found existing installation in: $INSTALL_DIR"
+        has_existing=true
+    fi
+
+    if [[ "$has_existing" == "true" && "$FORCE_REINSTALL" != "true" ]]; then
+        log_error "Existing installation detected. To reinstall, run with FORCE_REINSTALL=true"
+        log_info "Example: FORCE_REINSTALL=true $0"
+        exit 1
+    fi
+
+    if [[ "$has_existing" == "true" && "$FORCE_REINSTALL" == "true" ]]; then
+        log_warn "Force reinstall requested. Cleaning up existing installation..."
+
+        # Stop and disable service if running
+        if systemctl is-active --quiet $SYSTEMD_SERVICE; then
+            systemctl stop $SYSTEMD_SERVICE
+        fi
+        if systemctl is-enabled --quiet $SYSTEMD_SERVICE; then
+            systemctl disable $SYSTEMD_SERVICE
+        fi
+
+        # Remove service file
+        rm -f /etc/systemd/system/$SYSTEMD_SERVICE
+        systemctl daemon-reload
+    fi
+}
+
+# Detect Linux distribution
+detect_distro() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS=$ID
+        VER=$VERSION_ID
     else
-        # Build LLD from LLVM for AL2
-        sudo yum install -y llvm-toolset-7-lld 2>/dev/null || {
-            echo -e "${YELLOW}LLD not available, using default linker${NC}"
-        }
+        log_error "Cannot detect Linux distribution"
+        exit 1
     fi
-fi
+    log_info "Detected: $OS $VER"
+}
 
-# Install Rust if not present
-if ! command -v cargo &> /dev/null; then
-    echo -e "${GREEN}Installing Rust...${NC}"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-    source $HOME/.cargo/env
+# Update system packages
+update_system() {
+    log_info "Updating system packages..."
 
-    # Add aarch64 target
-    rustup target add aarch64-unknown-linux-gnu
-fi
+    case $OS in
+        ubuntu|debian)
+            apt-get update -y
+            apt-get upgrade -y
+            apt-get install -y \
+                build-essential \
+                git \
+                wget \
+                pkg-config \
+                libssl-dev \
+                htop \
+                iotop \
+                net-tools \
+                iptables-persistent \
+                fail2ban \
+                rsyslog \
+                logrotate \
+                chrony \
+                conntrack \
+                cron
+            ;;
+        amzn|centos|rhel|fedora)
+            yum update -y
+            yum groupinstall -y "Development Tools"
+            yum install -y \
+                git \
+                wget \
+                openssl-devel \
+                htop \
+                iotop \
+                net-tools \
+                iptables-services \
+                fail2ban \
+                rsyslog \
+                logrotate \
+                chrony \
+                conntrack-tools \
+                cronie \
+                crontabs
+            ;;
+        *)
+            log_error "Unsupported distribution: $OS"
+            exit 1
+            ;;
+    esac
 
-# Ensure we have the right target
-rustup target add aarch64-unknown-linux-gnu
+    log_success "System packages updated"
+}
 
-# Set ARM-specific build flags
-if [[ "$GRAVITON" == true ]]; then
-    export RUSTFLAGS="-C target-cpu=neoverse-n1 -C target-feature=+crc,+aes,+sha2,+fp16,+rcpc,+dotprod,+crypto"
+# Install Rust for ARM64
+install_rust() {
+    log_info "Checking Rust installation..."
 
-    # Use LLD if available
-    if command -v lld &> /dev/null; then
-        export RUSTFLAGS="$RUSTFLAGS -C link-arg=-fuse-ld=lld"
+    # Check if Rust is already installed
+    if command -v rustc &> /dev/null && command -v cargo &> /dev/null; then
+        local installed_version=$(rustc --version | awk '{print $2}')
+        log_info "Rust is already installed (version: $installed_version)"
+
+        # Source cargo env just in case
+        if [[ -f "$HOME/.cargo/env" ]]; then
+            source "$HOME/.cargo/env"
+        fi
+
+        # Ensure ARM64 target is added
+        rustup target add $CARGO_TARGET 2>/dev/null || true
+
+        log_success "Rust verified"
+        return
     fi
 
-    echo -e "${GREEN}Using Graviton2-specific optimizations${NC}"
-else
-    export RUSTFLAGS="-C target-cpu=native"
-    echo -e "${GREEN}Using native CPU optimizations${NC}"
-fi
+    log_info "Installing Rust for ARM64..."
 
-# Additional optimizations for release builds
-if [[ "$BUILD_TYPE" == "release" ]]; then
-    export RUSTFLAGS="$RUSTFLAGS -C lto=fat -C opt-level=3 -C codegen-units=1"
-fi
+    # Install rustup
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $RUST_VERSION
 
-# Set jemalloc path based on installation
-if [[ -f /usr/local/lib/libjemalloc.so ]]; then
-    export JEMALLOC_LIB_DIR=/usr/local/lib
-    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-elif [[ -f /usr/lib64/libjemalloc.so ]]; then
-    export JEMALLOC_LIB_DIR=/usr/lib64
-fi
+    # Source cargo env
+    source "$HOME/.cargo/env"
 
-# Build the project
-echo -e "${GREEN}Building $PROJECT_NAME ($BUILD_TYPE)...${NC}"
-if [[ "$BUILD_TYPE" == "release" ]]; then
-    cargo build --release --target aarch64-unknown-linux-gnu
-    BINARY_PATH="target/aarch64-unknown-linux-gnu/release/$PROJECT_NAME"
-else
-    cargo build --target aarch64-unknown-linux-gnu
-    BINARY_PATH="target/aarch64-unknown-linux-gnu/debug/$PROJECT_NAME"
-fi
+    # Add to profile if not already there
+    if ! grep -q 'source $HOME/.cargo/env' ~/.bashrc; then
+        echo 'source $HOME/.cargo/env' >> ~/.bashrc
+    fi
 
-# Strip binary for release
-if [[ "$BUILD_TYPE" == "release" ]]; then
-    echo -e "${GREEN}Stripping binary...${NC}"
-    strip "$BINARY_PATH" 2>/dev/null || echo "Strip not available"
-fi
+    # Verify installation
+    rustc --version >&2
+    cargo --version >&2
 
-# Check binary size
-BINARY_SIZE=$(du -h "$BINARY_PATH" | cut -f1)
-echo -e "${GREEN}Binary size: $BINARY_SIZE${NC}"
+    # Add ARM64 target
+    rustup target add $CARGO_TARGET
 
-# Create installation directory
-echo -e "${GREEN}Setting up installation directory...${NC}"
-sudo mkdir -p $INSTALL_DIR/logs
-sudo mkdir -p $INSTALL_DIR/cores
+    log_success "Rust installed successfully"
+}
 
-# Create cncnet user if it doesn't exist
-if ! id -u cncnet &>/dev/null; then
-    echo -e "${GREEN}Creating cncnet user...${NC}"
-    sudo useradd -r -s /sbin/nologin -d $INSTALL_DIR cncnet
-fi
+# Load necessary kernel modules (AWS-safe version)
+load_kernel_modules() {
+    log_info "Loading kernel modules for connection tracking..."
 
-# Copy binary
-echo -e "${GREEN}Installing binary...${NC}"
-sudo cp "$BINARY_PATH" "$INSTALL_DIR/"
-sudo chown cncnet:cncnet "$INSTALL_DIR/$PROJECT_NAME"
-sudo chmod +x "$INSTALL_DIR/$PROJECT_NAME"
+    # Only try to load modules that exist on Amazon Linux
+    local modules=(
+        "nf_conntrack"
+    )
 
-# Create systemd service file
-echo -e "${GREEN}Creating systemd service...${NC}"
-cat << 'EOF' | sudo tee /etc/systemd/system/cncnet.service
+    for module in "${modules[@]}"; do
+        if lsmod | grep -q "^$module"; then
+            log_info "Module already loaded: $module"
+        elif modprobe -n $module 2>/dev/null; then
+            if modprobe $module 2>/dev/null; then
+                log_info "Loaded module: $module"
+            else
+                log_warn "Could not load module: $module"
+            fi
+        else
+            log_warn "Module not available: $module"
+        fi
+    done
+
+    # Make modules persistent if the directory exists
+    if [[ -d /etc/modules-load.d ]]; then
+        # Check if already configured
+        if [[ ! -f /etc/modules-load.d/netfilter.conf ]]; then
+            echo "# Netfilter connection tracking modules" > /etc/modules-load.d/netfilter.conf
+            for module in "${modules[@]}"; do
+                if lsmod | grep -q "^$module"; then
+                    echo "$module" >> /etc/modules-load.d/netfilter.conf
+                fi
+            done
+        else
+            log_info "Kernel modules already configured"
+        fi
+    fi
+
+    log_success "Kernel modules configured"
+}
+
+# Configure system limits for high performance (AWS-safe)
+configure_system_limits() {
+    log_info "Configuring system limits for high performance..."
+
+    # Backup original files if not already backed up
+    if [[ ! -f /etc/security/limits.conf.backup ]]; then
+        cp /etc/security/limits.conf /etc/security/limits.conf.backup
+    fi
+    if [[ ! -f /etc/sysctl.conf.backup ]]; then
+        cp /etc/sysctl.conf /etc/sysctl.conf.backup
+    fi
+
+    # Check if limits are already configured
+    if ! grep -q "# CnCNet Server Limits" /etc/security/limits.conf; then
+        cat >> /etc/security/limits.conf << EOF
+
+# CnCNet Server Limits
+$SERVICE_USER soft nofile 1048576
+$SERVICE_USER hard nofile 1048576
+$SERVICE_USER soft nproc 65536
+$SERVICE_USER hard nproc 65536
+$SERVICE_USER soft memlock unlimited
+$SERVICE_USER hard memlock unlimited
+EOF
+    else
+        log_info "System limits already configured"
+    fi
+
+    # Check if sysctl settings are already configured
+    if ! grep -q "# CnCNet Server Network Optimizations" /etc/sysctl.conf; then
+        cat >> /etc/sysctl.conf << EOF
+
+# CnCNet Server Network Optimizations
+# Increase system IP port limits
+net.ipv4.ip_local_port_range = 1024 65535
+
+# Increase TCP buffer sizes for better throughput
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+
+# Increase UDP buffer sizes
+net.core.netdev_max_backlog = 30000
+
+# Enable TCP Fast Open
+net.ipv4.tcp_fastopen = 3
+
+# Increase socket listen backlog
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Optimize for low latency
+net.ipv4.tcp_low_latency = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+EOF
+
+        # Only add BBR if it's available
+        if modinfo tcp_bbr &>/dev/null; then
+            cat >> /etc/sysctl.conf << EOF
+
+# Enable BBR congestion control (if available)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+        fi
+
+        # Add connection tracking settings only if the module is loaded
+        if lsmod | grep -q nf_conntrack; then
+            cat >> /etc/sysctl.conf << EOF
+
+# Connection tracking for NAT (if available)
+net.netfilter.nf_conntrack_max = 1048576
+net.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_udp_timeout = 30
+net.netfilter.nf_conntrack_udp_timeout_stream = 60
+EOF
+        fi
+    else
+        log_info "Sysctl settings already configured"
+    fi
+
+    # Apply sysctl settings, ignoring errors for missing parameters
+    sysctl -p 2>&1 | grep -v "No such file or directory" || true
+
+    log_success "System limits configured"
+}
+
+# Configure firewall rules
+configure_firewall() {
+    log_info "Configuring firewall rules..."
+
+    # Check if rules already exist
+    local rules_exist=false
+
+    case $OS in
+        ubuntu|debian)
+            if command -v ufw &> /dev/null && ufw status | grep -q "$V3_PORT/udp"; then
+                rules_exist=true
+            fi
+            ;;
+        amzn|centos|rhel|fedora)
+            if iptables -L INPUT -n | grep -q "CnCNet"; then
+                rules_exist=true
+            fi
+            ;;
+    esac
+
+    if [[ "$rules_exist" == "true" ]]; then
+        log_info "Firewall rules already configured"
+        return
+    fi
+
+    # For Amazon Linux, we'll use iptables directly
+    case $OS in
+        ubuntu|debian)
+            # Install ufw if not present
+            apt-get install -y ufw
+
+            # Configure UFW
+            ufw --force reset
+            ufw default deny incoming
+            ufw default allow outgoing
+
+            # Allow SSH (adjust port if needed)
+            ufw allow 22/tcp comment "SSH"
+
+            # Allow CnCNet ports
+            ufw allow $V3_PORT/udp comment "CnCNet V3"
+            ufw allow $V2_PORT/udp comment "CnCNet V2 UDP"
+            ufw allow $V2_PORT/tcp comment "CnCNet V2 HTTP"
+            ufw allow $P2P_PORT1/udp comment "CnCNet P2P"
+            ufw allow $P2P_PORT2/udp comment "CnCNet STUN"
+
+            # Enable UFW
+            ufw --force enable
+            ;;
+
+        amzn|centos|rhel|fedora)
+            # For Amazon Linux, we'll add rules without changing default policies
+            # This prevents losing SSH access
+
+            # Check if iptables service exists
+            if systemctl list-unit-files | grep -q iptables.service; then
+                systemctl enable iptables 2>/dev/null || true
+                systemctl start iptables 2>/dev/null || true
+            fi
+
+            # Save current rules
+            if command -v iptables-save &> /dev/null; then
+                iptables-save > /tmp/iptables.backup 2>/dev/null || true
+            fi
+
+            # Add CnCNet rules without modifying existing AWS security group rules
+            # Allow CnCNet ports (INPUT)
+            iptables -I INPUT 1 -p udp --dport $V3_PORT -j ACCEPT -m comment --comment "CnCNet V3"
+            iptables -I INPUT 1 -p udp --dport $V2_PORT -j ACCEPT -m comment --comment "CnCNet V2 UDP"
+            iptables -I INPUT 1 -p tcp --dport $V2_PORT -j ACCEPT -m comment --comment "CnCNet V2 HTTP"
+            iptables -I INPUT 1 -p udp --dport $P2P_PORT1 -j ACCEPT -m comment --comment "CnCNet P2P"
+            iptables -I INPUT 1 -p udp --dport $P2P_PORT2 -j ACCEPT -m comment --comment "CnCNet STUN"
+
+            # Save rules based on the system
+            if [[ -f /etc/sysconfig/iptables ]]; then
+                iptables-save > /etc/sysconfig/iptables
+            elif command -v netfilter-persistent &> /dev/null; then
+                netfilter-persistent save
+            fi
+
+            log_warn "Remember to also configure AWS Security Group to allow ports: $V3_PORT/udp, $V2_PORT/tcp+udp, $P2P_PORT1/udp, $P2P_PORT2/udp"
+            ;;
+    esac
+
+    log_success "Firewall configured"
+}
+
+# Create service user
+create_service_user() {
+    log_info "Creating service user..."
+
+    if id "$SERVICE_USER" &>/dev/null; then
+        log_info "User $SERVICE_USER already exists"
+    else
+        useradd -r -s /sbin/nologin -d $INSTALL_DIR -c "CnCNet Server" $SERVICE_USER
+        log_success "Service user created"
+    fi
+}
+
+# Clone and build the project
+build_project() {
+    log_info "Cloning and building the project..."
+
+    # Create temporary build directory
+    local BUILD_DIR=$(mktemp -d)
+    cd $BUILD_DIR
+
+    # Clone repository
+    git clone $REPO_URL >&2
+    cd $PROJECT_NAME
+
+    # Build with optimizations for ARM64
+    log_info "Building release binary for ARM64..."
+
+    # Set build flags for maximum optimization
+    export RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat -C codegen-units=1"
+
+    # Build release binary
+    cargo build --release --target $CARGO_TARGET >&2
+
+    # Strip debug symbols (check if strip tool exists)
+    if command -v aarch64-linux-gnu-strip &> /dev/null; then
+        aarch64-linux-gnu-strip target/$CARGO_TARGET/release/$PROJECT_NAME >&2
+    elif command -v strip &> /dev/null; then
+        strip target/$CARGO_TARGET/release/$PROJECT_NAME >&2
+    fi
+
+    # Verify binary
+    file target/$CARGO_TARGET/release/$PROJECT_NAME >&2
+
+    log_success "Project built successfully"
+
+    # Return build directory - ONLY output the path, nothing else
+    echo $BUILD_DIR
+}
+
+# Install the application
+install_application() {
+    local build_dir=$1
+
+    log_info "Installing application..."
+
+    # Create directories
+    mkdir -p $INSTALL_DIR
+    mkdir -p $LOG_DIR
+    mkdir -p $CONFIG_DIR
+
+    # Copy binary
+    cp $build_dir/$PROJECT_NAME/target/$CARGO_TARGET/release/$PROJECT_NAME $INSTALL_DIR/
+    chmod +x $INSTALL_DIR/$PROJECT_NAME
+
+    # Set ownership
+    chown -R $SERVICE_USER:$SERVICE_USER $INSTALL_DIR
+    chown -R $SERVICE_USER:$SERVICE_USER $LOG_DIR
+
+    # Create or update configuration
+    if [[ -f $CONFIG_DIR/server.conf ]]; then
+        log_info "Configuration file already exists, preserving existing settings"
+        # Backup existing config
+        cp $CONFIG_DIR/server.conf $CONFIG_DIR/server.conf.$(date +%Y%m%d_%H%M%S)
+    else
+        # Don't escape values in the config file - they should be stored as-is
+        cat > $CONFIG_DIR/server.conf << EOF
+# CnCNet Server Configuration
+# Generated on $(date)
+
+# Server identification
+SERVER_NAME="${SERVER_NAME}"
+
+# Network ports
+V3_PORT=$V3_PORT
+V2_PORT=$V2_PORT
+
+# Performance settings
+MAX_CLIENTS=$MAX_CLIENTS
+IP_LIMIT_V3=$IP_LIMIT_V3
+IP_LIMIT_V2=$IP_LIMIT_V2
+
+# Master server
+MASTER_URL="${MASTER_URL}"
+NO_MASTER="${NO_MASTER}"
+
+# Security
+MAINT_PASSWORD="${MAINT_PASSWORD}"
+
+# Logging
+LOG_LEVEL="${LOG_LEVEL}"
+
+EOF
+      chown -R root:$SERVICE_USER $CONFIG_DIR
+      chmod 750 $CONFIG_DIR
+    fi
+
+    # Clean up build directory
+    rm -rf $build_dir
+
+    log_success "Application installed"
+}
+
+# Create systemd service
+create_systemd_service() {
+    log_info "Creating systemd service..."
+
+    # Check if service already exists
+    if [[ -f /etc/systemd/system/$SYSTEMD_SERVICE ]]; then
+        log_info "Systemd service already exists, updating..."
+        systemctl stop $SYSTEMD_SERVICE 2>/dev/null || true
+    fi
+
+    # Escape special characters for systemd
+    local escaped_server_name=$(escape_systemd_string "$SERVER_NAME")
+    local escaped_master_url=$(escape_systemd_string "$MASTER_URL")
+    local escaped_maint_password=$(escape_systemd_string "$MAINT_PASSWORD")
+
+    # Create the service file with proper quoting
+    cat > /etc/systemd/system/$SYSTEMD_SERVICE << EOF
 [Unit]
-Description=CnCNet Game Server
+Description=CnCNet High-Performance Game Server
+Documentation=https://github.com/khaledsmq/cncnet-server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=cncnet
-Group=cncnet
-WorkingDirectory=/opt/cncnet
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=$INSTALL_DIR
 
-# Environment variables
-Environment="RUST_LOG=info"
-Environment="RUST_BACKTRACE=1"
-Environment="TOKIO_WORKER_THREADS=2"
-
-# Jemalloc configuration
-Environment="LD_PRELOAD=/usr/local/lib/libjemalloc.so.2"
-Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:10000"
-
-# Resource limits for t4g.medium
-MemoryMax=3.5G
-MemoryHigh=3G
-CPUQuota=190%
-TasksMax=4096
-
-# Performance
-LimitNOFILE=1048576
-LimitNPROC=32768
-
-# Security
+# Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$LOG_DIR
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# Resource limits
+LimitNOFILE=1048576
+LimitNPROC=65536
+TasksMax=65536
 
 # Restart policy
 Restart=always
 RestartSec=5
-StartLimitBurst=3
-StartLimitInterval=60
+StartLimitInterval=300
+StartLimitBurst=5
 
-ExecStart=/opt/cncnet/cncnet-server \
-    --port 50001 \
-    --portv2 50000 \
-    --name "Dubai" \
-    --maxclients 200 \
-    --iplimit 8 \
-    --iplimitv2 4 \
-    --workers 2 \
-    --metrics-port 9090 \
-    --log-level info
+# Environment
+Environment="RUST_LOG=${LOG_LEVEL}"
+Environment="RUST_BACKTRACE=1"
+
+# Command with properly quoted parameters
+ExecStart=$INSTALL_DIR/$PROJECT_NAME \\
+    --port "$V3_PORT" \\
+    --portv2 "$V2_PORT" \\
+    --name "${escaped_server_name}" \\
+    --maxclients "$MAX_CLIENTS" \\
+    --iplimit "$IP_LIMIT_V3" \\
+    --iplimitv2 "$IP_LIMIT_V2" \\
+    --master "${escaped_master_url}" \\
+    --maintpw "${escaped_maint_password}"$([ "$NO_MASTER" = "true" ] && echo " \\\\\n    --nomaster" || echo "")
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cncnet-server
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Update jemalloc path in service file if needed
-if [[ -f /usr/lib64/libjemalloc.so.2 ]]; then
-    sudo sed -i 's|/usr/local/lib/libjemalloc.so.2|/usr/lib64/libjemalloc.so.2|' /etc/systemd/system/cncnet.service
-elif [[ ! -f /usr/local/lib/libjemalloc.so.2 ]]; then
-    # Remove jemalloc preload if not available
-    sudo sed -i '/LD_PRELOAD/d' /etc/systemd/system/cncnet.service
-    echo -e "${YELLOW}jemalloc not found, running without memory allocator optimization${NC}"
+    # Alternative approach: Create a wrapper script for even better handling
+    cat > $INSTALL_DIR/start-server.sh << 'EOF'
+#!/bin/bash
+# CnCNet Server startup wrapper
+# This script ensures proper argument handling for special characters
+
+# Enable debugging if needed
+if [[ "${DEBUG_WRAPPER}" == "true" ]]; then
+    set -x
 fi
 
-sudo systemctl daemon-reload
-
-# Apply kernel optimizations
-echo -e "${GREEN}Applying kernel optimizations...${NC}"
-cat << 'EOF' | sudo tee /etc/sysctl.d/99-cncnet-arm.conf
-# CnCNet Server ARM Optimizations
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.core.rmem_default = 16777216
-net.core.wmem_default = 16777216
-net.core.netdev_max_backlog = 16384
-net.core.netdev_budget = 600
-net.core.somaxconn = 65535
-
-# UDP tuning
-net.ipv4.udp_mem = 16384 174760 134217728
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-
-# TCP tuning
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-
-# Connection tracking
-net.netfilter.nf_conntrack_max = 262144
-net.netfilter.nf_conntrack_udp_timeout = 30
-
-# IP settings
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_tw_buckets = 2000000
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-
-# VM settings for ARM
-vm.swappiness = 10
-vm.dirty_ratio = 15
-vm.dirty_background_ratio = 5
-
-# File limits
-fs.file-max = 2097152
-fs.nr_open = 1048576
-EOF
-
-sudo sysctl -p /etc/sysctl.d/99-cncnet-arm.conf
-
-# Set up log rotation
-echo -e "${GREEN}Setting up log rotation...${NC}"
-cat << 'EOF' | sudo tee /etc/logrotate.d/cncnet
-/opt/cncnet/logs/*.log {
-    daily
-    missingok
-    rotate 7
-    compress
-    delaycompress
-    notifempty
-    create 0640 cncnet cncnet
-    sharedscripts
-    postrotate
-        systemctl reload cncnet 2>/dev/null || true
-    endscript
-}
-EOF
-
-# Enable RPS (Receive Packet Steering)
-if [[ "$GRAVITON" == true ]]; then
-    echo -e "${GREEN}Configuring RPS for network interfaces...${NC}"
-    for interface in $(ls /sys/class/net/ | grep -v lo); do
-        echo 3 | sudo tee /sys/class/net/$interface/queues/rx-*/rps_cpus > /dev/null 2>&1 || true
-    done
-fi
-
-# Set CPU governor to performance (if available)
-if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
-    echo -e "${GREEN}Setting CPU governor to performance...${NC}"
-    echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null 2>&1 || true
-fi
-
-# Configure firewall (if firewalld is installed)
-if command -v firewall-cmd &> /dev/null; then
-    echo -e "${GREEN}Configuring firewall...${NC}"
-    sudo firewall-cmd --permanent --add-port=50000/tcp
-    sudo firewall-cmd --permanent --add-port=50000/udp
-    sudo firewall-cmd --permanent --add-port=50001/udp
-    sudo firewall-cmd --permanent --add-port=8054/udp
-    sudo firewall-cmd --permanent --add-port=3478/udp
-    sudo firewall-cmd --permanent --add-port=9090/tcp
-    sudo firewall-cmd --reload
-fi
-
-# Configure iptables (if no firewalld)
-#if ! command -v firewall-cmd &> /dev/null && command -v iptables &> /dev/null; then
-#    echo -e "${GREEN}Configuring iptables...${NC}"
-#    sudo iptables -A INPUT -p tcp --dport 50000 -j ACCEPT
-#    sudo iptables -A INPUT -p udp --dport 50000 -j ACCEPT
-#    sudo iptables -A INPUT -p udp --dport 50001 -j ACCEPT
-#    sudo iptables -A INPUT -p udp --dport 8054 -j ACCEPT
-#    sudo iptables -A INPUT -p udp --dport 3478 -j ACCEPT
-#    sudo iptables -A INPUT -p tcp --dport 9090 -j ACCEPT
-#
-#    # Save iptables rules
-#    if command -v iptables-save &> /dev/null; then
-#        sudo iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
-#    fi
-#fi
-
-# Create environment file
-echo -e "${GREEN}Creating environment configuration...${NC}"
-cat << 'EOF' | sudo tee $INSTALL_DIR/.env
-# CnCNet Server Configuration
-PORT=50001
-PORTV2=50000
-SERVER_NAME=Dubai
-MAX_CLIENTS=200
-IP_LIMIT=8
-IP_LIMIT_V2=4
-WORKER_THREADS=2
-METRICS_PORT=9090
-LOG_LEVEL=info
-EOF
-
-# Set ownership
-sudo chown -R cncnet:cncnet $INSTALL_DIR
-
-# Enable and start service
-echo -e "${GREEN}Starting $SERVICE_NAME service...${NC}"
-sudo systemctl enable $SERVICE_NAME
-sudo systemctl restart $SERVICE_NAME
-
-# Wait for service to start
-sleep 3
-
-# Check service status
-if sudo systemctl is-active --quiet $SERVICE_NAME; then
-    echo -e "${GREEN}✓ Service started successfully!${NC}"
-
-    # Show brief status
-    sudo systemctl status $SERVICE_NAME --no-pager | head -n 10
-
-    # Test endpoints
-    echo -e "\n${GREEN}Testing endpoints...${NC}"
-
-    # Health check
-    if curl -s -o /dev/null -w "%{http_code}" http://localhost:9090/health 2>/dev/null | grep -q "200"; then
-        echo -e "${GREEN}✓ Health endpoint: OK${NC}"
-    else
-        echo -e "${YELLOW}⚠ Health endpoint: Not responding yet${NC}"
-    fi
-
-    # Metrics
-    if curl -s http://localhost:9090/metrics 2>/dev/null | grep -q "cncnet"; then
-        echo -e "${GREEN}✓ Metrics endpoint: OK${NC}"
-    else
-        echo -e "${YELLOW}⚠ Metrics endpoint: Not ready yet${NC}"
-    fi
-
-    # V2 Status
-    if curl -s http://localhost:50000/status 2>/dev/null | grep -q "slots"; then
-        echo -e "${GREEN}✓ V2 Status endpoint: OK${NC}"
-    else
-        echo -e "${YELLOW}⚠ V2 Status endpoint: Not ready yet${NC}"
-    fi
-
-    echo -e "\n${GREEN}=== Installation Complete ===${NC}"
-    echo -e "Server is running on:"
-    echo -e "  • Port 50000 (Tunnel v2 - TCP/UDP)"
-    echo -e "  • Port 50001 (Tunnel v3 - UDP)"
-    echo -e "  • Port 8054 (P2P - UDP)"
-    echo -e "  • Port 3478 (P2P - UDP)"
-    echo -e "  • Port 9090 (Metrics - TCP)"
-    echo -e "\nLogs: sudo journalctl -u $SERVICE_NAME -f"
+# Source configuration
+if [[ -f /etc/cncnet-server/server.conf ]]; then
+    source /etc/cncnet-server/server.conf
 else
-    echo -e "${RED}✗ Service failed to start${NC}"
-    sudo journalctl -u $SERVICE_NAME -n 50 --no-pager
+    echo "ERROR: Configuration file not found at /etc/cncnet-server/server.conf" >&2
     exit 1
 fi
 
-# Create monitoring script
-cat << 'EOF' | sudo tee $INSTALL_DIR/monitor.sh > /dev/null
-#!/bin/bash
-echo "=== CnCNet Server Monitor ==="
-echo "CPU & Memory:"
-top -b -n 1 | head -5
-echo ""
-echo "Network Connections:"
-ss -tunap | grep -E '5000[01]|8054|3478' | wc -l
-echo ""
-echo "Service Status:"
-systemctl is-active cncnet
-echo ""
-echo "Recent Logs:"
-journalctl -u cncnet -n 5 --no-pager
-echo ""
-echo "Metrics Summary:"
-curl -s localhost:9090/metrics 2>/dev/null | grep -E 'cncnet_v[23]_active_clients|cncnet_dropped_packets_total' | head -5
+# Validate required variables
+if [[ -z "$V3_PORT" ]] || [[ -z "$V2_PORT" ]] || [[ -z "$SERVER_NAME" ]]; then
+    echo "ERROR: Required configuration variables are missing" >&2
+    echo "V3_PORT=$V3_PORT" >&2
+    echo "V2_PORT=$V2_PORT" >&2
+    echo "SERVER_NAME=$SERVER_NAME" >&2
+    exit 1
+fi
+
+# Build command array
+CMD=(/opt/cncnet-server/cncnet-server)
+CMD+=(--port "$V3_PORT")
+CMD+=(--portv2 "$V2_PORT")
+CMD+=(--name "$SERVER_NAME")
+CMD+=(--maxclients "$MAX_CLIENTS")
+CMD+=(--iplimit "$IP_LIMIT_V3")
+CMD+=(--iplimitv2 "$IP_LIMIT_V2")
+CMD+=(--master "$MASTER_URL")
+CMD+=(--maintpw "$MAINT_PASSWORD")
+
+# Add optional parameters
+if [[ "$NO_MASTER" == "true" ]]; then
+    CMD+=(--nomaster)
+fi
+
+# Log the command being executed (useful for debugging)
+if [[ "${DEBUG_WRAPPER}" == "true" ]] || [[ "${RUST_LOG}" == "debug" ]]; then
+    echo "Executing command: ${CMD[@]}" >&2
+fi
+
+# Execute with proper argument handling
+exec "${CMD[@]}"
 EOF
 
-sudo chmod +x $INSTALL_DIR/monitor.sh
-sudo chown cncnet:cncnet $INSTALL_DIR/monitor.sh
+    chmod +x $INSTALL_DIR/start-server.sh
+    chown $SERVICE_USER:$SERVICE_USER $INSTALL_DIR/start-server.sh
 
-# Create uninstall script
-cat << 'EOF' | sudo tee $INSTALL_DIR/uninstall.sh > /dev/null
-#!/bin/bash
-echo "Stopping and removing CnCNet server..."
-sudo systemctl stop cncnet
-sudo systemctl disable cncnet
-sudo rm -f /etc/systemd/system/cncnet.service
-sudo rm -f /etc/sysctl.d/99-cncnet-arm.conf
-sudo rm -f /etc/logrotate.d/cncnet
-sudo rm -rf /opt/cncnet
-sudo userdel cncnet 2>/dev/null || true
-echo "CnCNet server uninstalled."
+    # Update systemd service to use wrapper script
+    cat > /etc/systemd/system/${SYSTEMD_SERVICE}.new << EOF
+[Unit]
+Description=CnCNet High-Performance Game Server
+Documentation=https://github.com/khaledsmq/cncnet-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=$INSTALL_DIR
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$LOG_DIR
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# Resource limits
+LimitNOFILE=1048576
+LimitNPROC=65536
+TasksMax=65536
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitInterval=300
+StartLimitBurst=5
+
+# Environment
+Environment="RUST_LOG=${LOG_LEVEL}"
+Environment="RUST_BACKTRACE=1"
+Environment="DEBUG_WRAPPER=false"
+
+# Use wrapper script for better argument handling
+ExecStart=$INSTALL_DIR/start-server.sh
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cncnet-server
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-sudo chmod +x $INSTALL_DIR/uninstall.sh
+    # Move new service file into place
+    mv /etc/systemd/system/${SYSTEMD_SERVICE}.new /etc/systemd/system/$SYSTEMD_SERVICE
 
-# Performance tips
-echo -e "\n${YELLOW}=== Quick Commands ===${NC}"
-echo "• Monitor: $INSTALL_DIR/monitor.sh"
-echo "• Logs: sudo journalctl -u cncnet -f"
-echo "• Status: sudo systemctl status cncnet"
-echo "• Restart: sudo systemctl restart cncnet"
-echo "• Uninstall: $INSTALL_DIR/uninstall.sh"
+    # Reload systemd
+    systemctl daemon-reload
 
-echo -e "\n${YELLOW}=== Performance Monitoring ===${NC}"
-echo "• CPU usage: top -p \$(pgrep cncnet-server)"
-echo "• Network: sudo tcpdump -i any -n port 50000 or port 50001"
-echo "• Metrics: curl -s localhost:9090/metrics | grep cncnet"
-echo "• Connections: ss -tunap | grep ESTABLISHED | grep cncnet"
+    log_success "Systemd service created"
+}
 
-echo -e "\n${GREEN}Build and installation complete on Amazon Linux!${NC}"
-echo -e "Instance type: t4g.medium (2 vCPU, 4GB RAM)"
-echo -e "Architecture: ARM64/Graviton2"
+# Configure logging
+configure_logging() {
+    log_info "Configuring logging..."
+
+    # Ensure rsyslog.d directory exists
+    if [[ ! -d /etc/rsyslog.d ]]; then
+        mkdir -p /etc/rsyslog.d
+    fi
+
+    # Check if rsyslog configuration already exists
+    if [[ ! -f /etc/rsyslog.d/50-cncnet.conf ]]; then
+        # Create rsyslog configuration
+        cat > /etc/rsyslog.d/50-cncnet.conf << 'EOF'
+# CnCNet Server Logging Configuration
+if $programname == 'cncnet-server' then {
+    # Log to dedicated file
+    action(type="omfile" file="/var/log/cncnet-server/server.log")
+
+    # Log errors separately
+    if $syslogseverity <= 3 then {
+        action(type="omfile" file="/var/log/cncnet-server/error.log")
+    }
+
+    # Stop processing after logging
+    stop
+}
+EOF
+    else
+        log_info "Rsyslog configuration already exists"
+    fi
+
+    # Ensure logrotate.d directory exists
+    if [[ ! -d /etc/logrotate.d ]]; then
+        mkdir -p /etc/logrotate.d
+    fi
+
+    # Check if logrotate configuration already exists
+    if [[ ! -f /etc/logrotate.d/cncnet-server ]]; then
+        # Create logrotate configuration
+        cat > /etc/logrotate.d/cncnet-server << EOF
+$LOG_DIR/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 $SERVICE_USER $SERVICE_USER
+    sharedscripts
+    postrotate
+        systemctl reload rsyslog > /dev/null 2>&1 || true
+    endscript
+}
+EOF
+    else
+        log_info "Logrotate configuration already exists"
+    fi
+
+    # Restart rsyslog if it exists
+    if systemctl list-unit-files | grep -q "rsyslog.service"; then
+        systemctl restart rsyslog 2>/dev/null || true
+    fi
+
+    log_success "Logging configured"
+}
+
+# Configure monitoring
+configure_monitoring() {
+    log_info "Configuring monitoring..."
+
+    # Create monitoring script
+    cat > $INSTALL_DIR/health_check.sh << 'EOF'
+#!/bin/bash
+# CnCNet Server Health Check
+
+# Check if service is running
+if ! systemctl is-active --quiet cncnet-server; then
+    echo "CRITICAL: CnCNet Server is not running"
+    exit 2
+fi
+
+# Check UDP ports
+for port in 50001 50000 8054 3478; do
+    if ! ss -uln | grep -q ":$port "; then
+        echo "WARNING: UDP port $port is not listening"
+        exit 1
+    fi
+done
+
+# Check TCP port (V2 HTTP)
+if ! ss -tln | grep -q ":50000 "; then
+    echo "WARNING: TCP port 50000 is not listening"
+    exit 1
+fi
+
+echo "OK: CnCNet Server is healthy"
+exit 0
+EOF
+
+    chmod +x $INSTALL_DIR/health_check.sh
+
+    # Create cron job for monitoring
+    # First check if cron.d directory exists, create if needed
+    if [[ ! -d /etc/cron.d ]]; then
+        mkdir -p /etc/cron.d
+    fi
+
+    # Check if cron job already exists
+    if [[ ! -f /etc/cron.d/cncnet-monitor ]]; then
+        cat > /etc/cron.d/cncnet-monitor << EOF
+# CnCNet Server Monitoring
+*/5 * * * * root $INSTALL_DIR/health_check.sh || systemctl restart cncnet-server
+EOF
+
+        # Set proper permissions for cron file
+        chmod 644 /etc/cron.d/cncnet-monitor
+    else
+        log_info "Cron monitoring job already exists"
+    fi
+
+    # Restart cron service if it exists
+    if systemctl list-unit-files | grep -q "crond.service"; then
+        systemctl restart crond 2>/dev/null || true
+    elif systemctl list-unit-files | grep -q "cron.service"; then
+        systemctl restart cron 2>/dev/null || true
+    fi
+
+    log_success "Monitoring configured"
+}
+
+# Configure fail2ban for DDoS protection
+configure_fail2ban() {
+    log_info "Configuring fail2ban..."
+
+    # Check if fail2ban is installed
+    if ! command -v fail2ban-client &> /dev/null; then
+        log_warn "fail2ban not installed, skipping configuration"
+        return
+    fi
+
+    # Check if filter already exists
+    if [[ ! -f /etc/fail2ban/filter.d/cncnet.conf ]]; then
+        # Create fail2ban filter
+        cat > /etc/fail2ban/filter.d/cncnet.conf << 'EOF'
+[Definition]
+failregex = Rate limit exceeded for IP: <HOST>
+            Rate limit exceeded for <HOST>
+ignoreregex =
+EOF
+    else
+        log_info "Fail2ban filter already exists"
+    fi
+
+    # Check if jail already exists
+    if [[ ! -f /etc/fail2ban/jail.d/cncnet.conf ]]; then
+        # Create fail2ban jail
+        cat > /etc/fail2ban/jail.d/cncnet.conf << EOF
+[cncnet]
+enabled = true
+filter = cncnet
+action = iptables-multiport[name=cncnet, port="$V3_PORT,$V2_PORT,$P2P_PORT1,$P2P_PORT2", protocol=udp]
+logpath = /var/log/cncnet-server/server.log
+maxretry = 5
+findtime = 60
+bantime = 3600
+EOF
+    else
+        log_info "Fail2ban jail already exists"
+    fi
+
+    # Restart fail2ban
+    systemctl restart fail2ban 2>/dev/null || true
+    systemctl enable fail2ban 2>/dev/null || true
+
+    log_success "Fail2ban configured"
+}
+
+# Performance tuning specific to ARM64
+tune_arm64_performance() {
+    log_info "Tuning ARM64 performance..."
+
+    # Set CPU governor to performance if available
+    if [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
+        local governor_changed=false
+        for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            if [[ -w $cpu ]]; then
+                current_governor=$(cat $cpu 2>/dev/null || echo "unknown")
+                if [[ "$current_governor" != "performance" ]]; then
+                    echo performance > $cpu 2>/dev/null && governor_changed=true || true
+                fi
+            fi
+        done
+
+        if [[ "$governor_changed" == "true" ]]; then
+            log_info "CPU governor set to performance mode"
+        else
+            log_info "CPU governor already in performance mode or cannot be changed"
+        fi
+    fi
+
+    # Disable CPU frequency scaling service if exists
+    systemctl stop cpufrequtils 2>/dev/null || true
+    systemctl disable cpufrequtils 2>/dev/null || true
+
+    # Set IRQ affinity for network interfaces (if accessible)
+    if [[ -r /proc/interrupts ]]; then
+        for irq in $(grep -E 'eth|ens|enp' /proc/interrupts | awk '{print $1}' | sed 's/://'); do
+            if [[ -w /proc/irq/$irq/smp_affinity ]]; then
+                echo ff > /proc/irq/$irq/smp_affinity 2>/dev/null || true
+            fi
+        done
+    fi
+
+    log_success "ARM64 performance tuned"
+}
+
+# Start and enable services
+start_services() {
+    log_info "Starting services..."
+
+    # Enable and start the service
+    systemctl enable $SYSTEMD_SERVICE
+    systemctl start $SYSTEMD_SERVICE
+
+    # Wait for service to start
+    sleep 3
+
+    # Check status
+    if systemctl is-active --quiet $SYSTEMD_SERVICE; then
+        log_success "CnCNet Server started successfully"
+        systemctl status $SYSTEMD_SERVICE --no-pager
+    else
+        log_error "Failed to start CnCNet Server"
+        journalctl -u $SYSTEMD_SERVICE --no-pager -n 50
+        exit 1
+    fi
+}
+
+# Display final information
+display_info() {
+    # Read maintenance password from config
+    local maint_pw=""
+    if [[ -f $CONFIG_DIR/server.conf ]]; then
+        maint_pw=$(grep MAINT_PASSWORD $CONFIG_DIR/server.conf | cut -d'=' -f2 | cut -d'"' -f2)
+    fi
+
+    echo >&2
+    echo "=========================================" >&2
+    echo "   CnCNet Server Installation Complete" >&2
+    echo "=========================================" >&2
+    echo >&2
+    echo "Server Status: $(systemctl is-active $SYSTEMD_SERVICE)" >&2
+    echo "Configuration: $CONFIG_DIR/server.conf" >&2
+    echo "Logs: $LOG_DIR/" >&2
+    echo >&2
+    echo "Network Ports:" >&2
+    echo "  - Tunnel V3: UDP $V3_PORT" >&2
+    echo "  - Tunnel V2: UDP/TCP $V2_PORT" >&2
+    echo "  - P2P NAT:   UDP $P2P_PORT1, $P2P_PORT2" >&2
+    echo >&2
+    if [[ -n "$maint_pw" ]]; then
+        echo "Maintenance Password: $maint_pw" >&2
+    fi
+    echo >&2
+    echo "IMPORTANT: Configure AWS Security Group to allow:" >&2
+    echo "  - UDP $V3_PORT (from 0.0.0.0/0)" >&2
+    echo "  - TCP/UDP $V2_PORT (from 0.0.0.0/0)" >&2
+    echo "  - UDP $P2P_PORT1 (from 0.0.0.0/0)" >&2
+    echo "  - UDP $P2P_PORT2 (from 0.0.0.0/0)" >&2
+    echo >&2
+    echo "Useful Commands:" >&2
+    echo "  - View logs:     journalctl -u $SYSTEMD_SERVICE -f" >&2
+    echo "  - Check status:  systemctl status $SYSTEMD_SERVICE" >&2
+    echo "  - Restart:       systemctl restart $SYSTEMD_SERVICE" >&2
+    echo "  - Health check:  $INSTALL_DIR/health_check.sh" >&2
+    echo >&2
+    echo "=========================================" >&2
+}
+
+# Main installation flow
+main() {
+    log_info "Starting CnCNet Server installation for AWS ARM64"
+
+    # Pre-flight checks
+    check_root
+    check_existing_installation
+    detect_distro
+
+    # System preparation
+    update_system
+    load_kernel_modules
+    install_rust
+    configure_system_limits
+    configure_firewall
+
+    # User and directories
+    create_service_user
+
+    # Build and install
+    BUILD_DIR=$(build_project)
+    install_application $BUILD_DIR
+
+    # Service configuration
+    create_systemd_service
+    configure_logging
+    configure_monitoring
+    configure_fail2ban
+    tune_arm64_performance
+
+    # Start services
+    start_services
+
+    # Display summary
+    display_info
+
+    log_success "Installation completed successfully!"
+}
+
+# Run main function
+main "$@"
