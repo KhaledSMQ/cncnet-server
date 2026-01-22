@@ -63,20 +63,24 @@ The server can be configured via command-line arguments or environment variables
 ./target/release/cncnet-server --help
 ```
 
-| Option                   | Default          | Description                          |
-|--------------------------|------------------|--------------------------------------|
-| `--port`                 | 50001            | TunnelV3 (main) server port          |
-| `--port-v2`              | 50000            | TunnelV2 (compatibility) server port |
-| `--name`                 | "Unnamed server" | Server name for master server        |
-| `--max-clients`          | 1000000          | Maximum concurrent clients           |
-| `--worker-threads`       | 8                | Number of worker threads             |
-| `--socket-buffer-size`   | 65536            | Socket buffer size in bytes          |
-| `--ip-limit`             | 32               | Max connections per IP (V3)          |
-| `--ip-limit-v2`          | 16               | Max connections per IP (V2)          |
-| `--master-password`      | ""               | Master server password               |
-| `--maintenance-password` | ""               | Maintenance mode password            |
-| `--no-master`            | false            | Disable master server announcements  |
-| `--no-p2p`               | false            | Disable P2P STUN servers             |
+| Option           | Environment Variable | Default                           | Description                                 |
+| ---------------- | -------------------- | --------------------------------- | ------------------------------------------- |
+| `--port`         | `PORT`               | 50001                             | TunnelV3 (main) server port                 |
+| `--portv2`       | `PORTV2`             | 50000                             | TunnelV2 (compatibility) server port        |
+| `--name`         | `SERVER_NAME`        | "Unnamed server"                  | Server name for master server               |
+| `--maxclients`   | `MAX_CLIENTS`        | 200                               | Maximum concurrent clients                  |
+| `--workers`      | `WORKER_THREADS`     | 0                                 | Number of worker threads (0 = auto)         |
+| `--iplimit`      | `IP_LIMIT`           | 8                                 | Max connections per IP (V3)                 |
+| `--iplimitv2`    | `IP_LIMIT_V2`        | 4                                 | Max connections per IP (V2)                 |
+| `--masterpw`     | `MASTER_PW`          | ""                                | Master server password                      |
+| `--maintpw`      | `MAINT_PW`           | "test123456"                      | Maintenance mode password                   |
+| `--master`       | `MASTER_URL`         | http://cncnet.org/master-announce | Master server URL                           |
+| `--nomaster`     | `NO_MASTER`          | false                             | Disable master server announcements         |
+| `--nop2p`        | `NO_P2P`             | false                             | Disable P2P STUN servers                    |
+| `--metrics-port` | `METRICS_PORT`       | 9090                              | Prometheus metrics port                     |
+| `--log-level`    | `LOG_LEVEL`          | "info"                            | Logging level (trace/debug/info/warn/error) |
+| `--log-format`   | `LOG_FORMAT`         | "pretty"                          | Log format (pretty/json)                    |
+
 
 ### Configuration File
 
@@ -121,8 +125,8 @@ log_file = "/var/log/cncnet-server/server.log"
 # Start with custom configuration
 ./target/release/cncnet-server \
   --name "My Server" \
-  --max-clients 500000 \
-  --worker-threads 16
+  --maxclients 500000 \
+  --workers 16
 ```
 
 ### Production Deployment
