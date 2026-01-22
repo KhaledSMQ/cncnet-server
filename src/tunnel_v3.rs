@@ -9,7 +9,6 @@ use dashmap::DashMap;
 use sha1::{Digest, Sha1};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
