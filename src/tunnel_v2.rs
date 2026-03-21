@@ -646,7 +646,15 @@ impl TunnelV2 {
             maintenance
         );
 
-        match reqwest::get(&url).await {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .local_address("0.0.0.0".parse().ok())
+            .build()
+            .expect("Failed to create HTTP client");
+
+        match http_client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 debug!("V2 master announce sent successfully");
             }

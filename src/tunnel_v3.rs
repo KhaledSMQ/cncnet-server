@@ -175,6 +175,7 @@ impl TunnelV3 {
             .timeout(Duration::from_secs(10))
             .pool_max_idle_per_host(1)
             .pool_idle_timeout(Duration::from_secs(30))
+            .local_address("0.0.0.0".parse().ok())
             .build()
             .expect("Failed to create HTTP client");
 
