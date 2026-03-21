@@ -144,10 +144,8 @@ else
     echo -e "${GREEN}Using native CPU optimizations${NC}"
 fi
 
-# Additional optimizations for release builds
-if [[ "$BUILD_TYPE" == "release" ]]; then
-    export RUSTFLAGS="$RUSTFLAGS -C lto=fat -C opt-level=3 -C codegen-units=1"
-fi
+# Note: lto, opt-level, and codegen-units are set in Cargo.toml [profile.release].
+# Do not duplicate them in RUSTFLAGS — env RUSTFLAGS overrides Cargo.toml rustflags.
 
 # Set jemalloc path based on installation
 if [[ -f /usr/local/lib/libjemalloc.so ]]; then
@@ -211,10 +209,10 @@ WorkingDirectory=/opt/cncnet
 # Environment variables
 Environment="RUST_LOG=info"
 Environment="RUST_BACKTRACE=1"
-Environment="TOKIO_WORKER_THREADS=2"
 
-# Jemalloc configuration
-Environment="LD_PRELOAD=/usr/local/lib/libjemalloc.so.2"
+# Note: jemalloc is statically linked via tikv-jemallocator in the binary.
+# Do NOT use LD_PRELOAD with system jemalloc — it conflicts with the embedded allocator.
+# MALLOC_CONF is read by the embedded jemalloc at startup.
 Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:10000"
 
 # Resource limits for t4g.medium
@@ -253,16 +251,12 @@ ExecStart=/opt/cncnet/cncnet-server \
 WantedBy=multi-user.target
 EOF
 
-# Update jemalloc path in service file if needed
-if [[ -f /usr/lib64/libjemalloc.so.2 ]]; then
-    sudo sed -i 's|/usr/local/lib/libjemalloc.so.2|/usr/lib64/libjemalloc.so.2|' /etc/systemd/system/cncnet.service
-elif [[ ! -f /usr/local/lib/libjemalloc.so.2 ]]; then
-    # Remove jemalloc preload if not available
-    sudo sed -i '/LD_PRELOAD/d' /etc/systemd/system/cncnet.service
-    echo -e "${YELLOW}jemalloc not found, running without memory allocator optimization${NC}"
-fi
-
 sudo systemctl daemon-reload
+
+# Load kernel modules required by sysctl settings
+echo -e "${GREEN}Loading kernel modules...${NC}"
+sudo modprobe tcp_bbr 2>/dev/null || echo -e "${YELLOW}tcp_bbr module not available, skipping BBR${NC}"
+sudo modprobe nf_conntrack 2>/dev/null || echo -e "${YELLOW}nf_conntrack module not available${NC}"
 
 # Apply kernel optimizations
 echo -e "${GREEN}Applying kernel optimizations...${NC}"
@@ -308,7 +302,8 @@ fs.file-max = 2097152
 fs.nr_open = 1048576
 EOF
 
-sudo sysctl -p /etc/sysctl.d/99-cncnet-arm.conf
+# Apply sysctl; ignore errors for unavailable settings (e.g., nf_conntrack if module didn't load)
+sudo sysctl -p /etc/sysctl.d/99-cncnet-arm.conf 2>&1 | grep -v "No such file" || true
 
 # Set up log rotation
 echo -e "${GREEN}Setting up log rotation...${NC}"
