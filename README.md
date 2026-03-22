@@ -156,7 +156,7 @@ The server is optimized for AWS Graviton (ARM64) instances.
 Launch a fully configured server on AWS with a single click. This provisions a Graviton EC2 instance,
 security group, Elastic IP, and builds/starts the server automatically.
 
-[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home#/stacks/new?stackName=cncnet-server&templateURL=https://raw.githubusercontent.com/khaledsmq/cncnet-server/main/cloudformation/cncnet-server.yaml)
+[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home#/stacks/new?stackName=cncnet-server&templateURL=https://cncnet.s3.me-central-1.amazonaws.com/cncnet-server.yaml)
 
 > **Prerequisites**: An AWS account and an existing [EC2 key pair](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-key-pairs.html) in the target region.
 
@@ -182,7 +182,7 @@ You can also deploy via the AWS CLI:
 ```bash
 aws cloudformation create-stack \
   --stack-name cncnet-server \
-  --template-body file://cloudformation/cncnet-server.yaml \
+  --template-url https://cncnet.s3.me-central-1.amazonaws.com/cncnet-server.yaml \
   --parameters \
     ParameterKey=KeyName,ParameterValue=my-key \
     ParameterKey=ServerName,ParameterValue="My CnCNet Server" \
