@@ -197,6 +197,9 @@ Resources:
           #!/bin/bash -xe
           exec > >(tee /var/log/cncnet-cfn-init.log) 2>&1
 
+          export HOME=/root
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.cargo/bin"
+
           # Install cfn-signal helper and git
           dnf install -y aws-cfn-bootstrap git
 
@@ -207,16 +210,21 @@ Resources:
           git clone https://github.com/khaledsmq/cncnet-server.git
           cd cncnet-server
 
-          # Run the full ARM64 setup script with parameters
-          export SERVER_NAME="${ServerName}"
-          export MAX_CLIENTS="${MaxClients}"
-          export V3_PORT="${V3Port}"
-          export V2_PORT="${V2Port}"
-          export NO_MASTER="${NoMaster}"
-          export LOG_LEVEL="info"
-          export FORCE_REINSTALL="true"
+          # Build and install using the Amazon Linux build script
+          bash build-arm.sh
 
-          bash scripts/aws_arm64_build.sh
+          # Update the systemd service with user-provided parameters
+          sed -i 's|--name "Dubai"|--name "${ServerName}"|' /etc/systemd/system/cncnet.service
+          sed -i 's|--maxclients 200|--maxclients ${MaxClients}|' /etc/systemd/system/cncnet.service
+          sed -i 's|--port 50001|--port ${V3Port}|' /etc/systemd/system/cncnet.service
+          sed -i 's|--portv2 50000|--portv2 ${V2Port}|' /etc/systemd/system/cncnet.service
+
+          if [ "${NoMaster}" = "true" ]; then
+            sed -i 's|--log-level info|--log-level info --nomaster|' /etc/systemd/system/cncnet.service
+          fi
+
+          systemctl daemon-reload
+          systemctl restart cncnet
 
           echo "=== CnCNet Server deployment complete ==="
 
