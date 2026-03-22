@@ -144,6 +144,12 @@ Resources:
           CidrIp: !Ref MetricsAccessCidr
           Description: Metrics / Health
 
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+          Description: ICMP Ping
+
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-sg"

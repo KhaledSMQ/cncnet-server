@@ -429,7 +429,7 @@ impl TunnelV2 {
                 let new_client =
                     Arc::new(TunnelClient::new_with_endpoint(remote_addr, TIMEOUT_SECONDS));
                 self.mappings.insert(sender_id, new_client);
-                debug!("New V2 connection from {} ID {}", remote_addr, sender_id);
+                info!("V2 client connected: ID={}, endpoint={}", sender_id, remote_addr);
             } else if let Some(ep) = sender.remote_ep {
                 if ep != remote_addr {
                     if sender.is_timed_out() {
@@ -438,6 +438,7 @@ impl TunnelV2 {
                             TIMEOUT_SECONDS,
                         ));
                         self.mappings.insert(sender_id, new_client);
+                        info!("V2 client reconnected (previous timed out): ID={}, new_endpoint={}, old_endpoint={}", sender_id, remote_addr, ep);
                     } else {
                         return;
                     }
@@ -488,7 +489,18 @@ impl TunnelV2 {
     }
 
     async fn cleanup_expired_mappings(&self) {
-        self.mappings.retain(|_key, value| !value.is_timed_out());
+        self.mappings.retain(|key, value| {
+            if value.is_timed_out() {
+                let ep = value
+                    .remote_ep
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "never connected".into());
+                warn!("V2 client disconnected (timeout): ID={}, endpoint={}", key, ep);
+                false
+            } else {
+                true
+            }
+        });
 
         self.metrics
             .v2_active_clients

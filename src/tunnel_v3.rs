@@ -266,6 +266,7 @@ impl TunnelV3 {
                             self.mappings.insert(sender_id, new_client);
                             self.quality_analyzers
                                 .insert(sender_id, QualityAnalyzer::new());
+                            info!("V3 client reconnected (previous timed out): ID={}, new_endpoint={}, old_endpoint={}", sender_id, remote_addr, ep);
                             true
                         } else {
                             false
@@ -295,17 +296,20 @@ impl TunnelV3 {
                 self.metrics
                     .v3_active_clients
                     .store(self.mappings.len(), Ordering::Release);
+                info!("V3 client connected: ID={}, endpoint={}", sender_id, remote_addr);
                 true
             } else {
                 self.metrics
                     .rate_limit_hits
                     .fetch_add(1, Ordering::Relaxed);
+                warn!("V3 client rejected (rate limit): ID={}, endpoint={}", sender_id, remote_addr);
                 false
             }
         } else {
             self.metrics
                 .dropped_packets
                 .fetch_add(1, Ordering::Relaxed);
+            warn!("V3 client rejected (server full): ID={}, endpoint={}", sender_id, remote_addr);
             false
         };
 
@@ -394,6 +398,11 @@ impl TunnelV3 {
     async fn cleanup_expired_mappings(&self) {
         self.mappings.retain(|key, value| {
             if value.is_timed_out() {
+                let ep = value
+                    .remote_ep
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "never connected".into());
+                warn!("V3 client disconnected (timeout): ID={}, endpoint={}", key, ep);
                 self.quality_analyzers.remove(key);
                 false
             } else {
