@@ -1,19 +1,23 @@
-use tokio::sync::broadcast;
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::watch;
 
+/// Coordinates graceful shutdown across multiple async tasks.
+///
+/// Late subscribers (created after `shutdown()`) will see the shutdown
+/// immediately. Dropping the coordinator also wakes all receivers.
 #[derive(Clone)]
 pub struct ShutdownCoordinator {
-    sender: broadcast::Sender<()>,
-    is_shutting_down: Arc<RwLock<bool>>,
+    sender: Arc<watch::Sender<bool>>,
+    is_shutting_down: Arc<AtomicBool>,
 }
 
 impl ShutdownCoordinator {
     pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(1);
+        let (sender, _) = watch::channel(false);
         Self {
-            sender,
-            is_shutting_down: Arc::new(RwLock::new(false)),
+            sender: Arc::new(sender),
+            is_shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -23,25 +27,20 @@ impl ShutdownCoordinator {
         }
     }
 
-    pub async fn shutdown(&self) {
-        let mut shutting_down = self.is_shutting_down.write().await;
-        if !*shutting_down {
-            *shutting_down = true;
-            let _ = self.sender.send(());
+    /// Trigger shutdown. Safe to call multiple times — only the first call fires.
+    pub fn shutdown(&self) {
+        if !self.is_shutting_down.swap(true, Ordering::AcqRel) {
+            self.sender.send_replace(true);
         }
-    }
-
-    pub async fn is_shutting_down(&self) -> bool {
-        *self.is_shutting_down.read().await
     }
 }
 
 pub struct ShutdownReceiver {
-    receiver: broadcast::Receiver<()>,
+    receiver: watch::Receiver<bool>,
 }
 
 impl ShutdownReceiver {
     pub async fn recv(&mut self) {
-        let _ = self.receiver.recv().await;
+        let _ = self.receiver.wait_for(|&shutdown| shutdown).await;
     }
 }

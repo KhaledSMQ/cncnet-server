@@ -1,0 +1,10 @@
+.git
+target
+*.md
+LICENSE
+.gitignore
+.github
+.vscode
+.cursor
+cloudformation
+scripts

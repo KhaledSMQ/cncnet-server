@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -14,22 +14,25 @@ pub struct ServerConfig {
     pub ip_limit: usize,
     pub ip_limit_v2: usize,
     pub no_p2p: bool,
-    pub worker_threads: usize,
     pub metrics_port: u16,
 }
 
 impl ServerConfig {
     pub fn from_args(args: crate::Args) -> Result<Self> {
-        // Validate ports
         if args.port <= 1024 && args.port != 0 {
-            bail!("Port {} requires root privileges. Use a port > 1024 or 0 for auto", args.port);
+            bail!(
+                "Port {} requires root privileges. Use a port > 1024 or 0 for auto",
+                args.port
+            );
         }
 
         if args.portv2 <= 1024 && args.portv2 != 0 {
-            bail!("Port {} requires root privileges. Use a port > 1024 or 0 for auto", args.portv2);
+            bail!(
+                "Port {} requires root privileges. Use a port > 1024 or 0 for auto",
+                args.portv2
+            );
         }
 
-        // Validate limits
         if args.maxclients < 2 {
             bail!("Max clients must be at least 2");
         }
@@ -50,7 +53,6 @@ impl ServerConfig {
             ip_limit: args.iplimit.max(1).min(100),
             ip_limit_v2: args.iplimitv2.max(1).min(100),
             no_p2p: args.nop2p,
-            worker_threads: args.workers,
             metrics_port: args.metrics_port,
         })
     }

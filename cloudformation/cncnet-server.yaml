@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CnCNet Tunnel Server — one-click deploy on AWS Graviton (ARM64).
+  Provisions an EC2 instance, security group, and Elastic IP, then
+  builds and starts the server automatically via the repo's setup script.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access
+
+  InstanceType:
+    Type: String
+    Default: t4g.medium
+    AllowedValues:
+      - t4g.micro
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+      - t4g.xlarge
+      - c7g.medium
+      - c7g.large
+      - c7g.xlarge
+    Description: ARM64/Graviton instance type (t4g.medium recommended)
+
+  ServerName:
+    Type: String
+    Default: CnCNet Server
+    Description: Server name shown in the CnCNet master server list
+    MaxLength: 64
+
+  MaxClients:
+    Type: Number
+    Default: 200
+    MinValue: 2
+    MaxValue: 10000
+    Description: Maximum concurrent tunnel clients
+
+  V3Port:
+    Type: Number
+    Default: 50001
+    MinValue: 1025
+    MaxValue: 65535
+    Description: TunnelV3 UDP port
+
+  V2Port:
+    Type: Number
+    Default: 50000
+    MinValue: 1025
+    MaxValue: 65535
+    Description: TunnelV2 UDP + HTTP port
+
+  NoMaster:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Disable master server announcements
+
+  MetricsAccessCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR block allowed to reach the metrics port (9090/tcp).
+      Restrict this to your IP for security (e.g. 203.0.113.5/32).
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR (e.g. 0.0.0.0/0 or 203.0.113.5/32)
+
+  SSHAccessCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR block allowed for SSH access (22/tcp).
+      Restrict this to your IP for security (e.g. 203.0.113.5/32).
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR (e.g. 0.0.0.0/0 or 203.0.113.5/32)
+
+  VolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 100
+    Description: Root EBS volume size in GiB
+
+# ---------------------------------------------------------------------------
+# Mappings — latest Amazon Linux 2023 ARM64 AMIs per region
+# ---------------------------------------------------------------------------
+Mappings:
+  RegionAMI:
+    us-east-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    us-east-2:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    us-west-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    us-west-2:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    eu-west-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    eu-west-2:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    eu-west-3:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    eu-central-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    eu-north-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    ap-southeast-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    ap-southeast-2:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    ap-northeast-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    ap-northeast-2:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    ap-south-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    sa-east-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    ca-central-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    me-south-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    me-central-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    il-central-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    af-south-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # --- Security Group ---
+  CnCNetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CnCNet Tunnel Server ports
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHAccessCidr
+          Description: SSH
+
+        - IpProtocol: udp
+          FromPort: !Ref V3Port
+          ToPort: !Ref V3Port
+          CidrIp: 0.0.0.0/0
+          Description: TunnelV3 UDP
+
+        - IpProtocol: udp
+          FromPort: !Ref V2Port
+          ToPort: !Ref V2Port
+          CidrIp: 0.0.0.0/0
+          Description: TunnelV2 UDP
+
+        - IpProtocol: tcp
+          FromPort: !Ref V2Port
+          ToPort: !Ref V2Port
+          CidrIp: 0.0.0.0/0
+          Description: TunnelV2 HTTP
+
+        - IpProtocol: udp
+          FromPort: 8054
+          ToPort: 8054
+          CidrIp: 0.0.0.0/0
+          Description: P2P STUN (8054)
+
+        - IpProtocol: udp
+          FromPort: 3478
+          ToPort: 3478
+          CidrIp: 0.0.0.0/0
+          Description: P2P STUN (3478)
+
+        - IpProtocol: tcp
+          FromPort: 9090
+          ToPort: 9090
+          CidrIp: !Ref MetricsAccessCidr
+          Description: Metrics / Health
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  # --- IAM Role (minimal — SSM agent + CloudWatch logs) ---
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # --- EC2 Instance ---
+  CnCNetInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [RegionAMI, !Ref "AWS::Region", AMI]
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !GetAtt CnCNetSecurityGroup.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            Iops: 3000
+            Throughput: 125
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-server"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/cncnet-cfn-init.log) 2>&1
+
+          # Install cfn-signal helper and git
+          dnf install -y aws-cfn-bootstrap git
+
+          echo "=== Starting CnCNet Server deployment ==="
+
+          # Clone the repository
+          cd /tmp
+          git clone https://github.com/khaledsmq/cncnet-server.git
+          cd cncnet-server
+
+          # Run the full ARM64 setup script with parameters
+          export SERVER_NAME="${ServerName}"
+          export MAX_CLIENTS="${MaxClients}"
+          export V3_PORT="${V3Port}"
+          export V2_PORT="${V2Port}"
+          export NO_MASTER="${NoMaster}"
+          export LOG_LEVEL="info"
+          export FORCE_REINSTALL="true"
+
+          bash scripts/aws_arm64_build.sh
+
+          echo "=== CnCNet Server deployment complete ==="
+
+          # Signal CloudFormation that we're done
+          /opt/aws/bin/cfn-signal -e $? \
+            --stack ${AWS::StackName} \
+            --resource CnCNetInstance \
+            --region ${AWS::Region}
+
+  # --- Elastic IP ---
+  CnCNetEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref CnCNetInstance
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-eip"
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  PublicIP:
+    Description: Server public IP (Elastic IP)
+    Value: !Ref CnCNetEIP
+
+  SSHCommand:
+    Description: SSH into the server
+    Value: !Sub "ssh -i ${KeyName}.pem ec2-user@${CnCNetEIP}"
+
+  TunnelV3Endpoint:
+    Description: TunnelV3 UDP endpoint
+    Value: !Sub "${CnCNetEIP}:${V3Port}"
+
+  TunnelV2Endpoint:
+    Description: TunnelV2 UDP+HTTP endpoint
+    Value: !Sub "${CnCNetEIP}:${V2Port}"
+
+  HealthCheckURL:
+    Description: Health check endpoint
+    Value: !Sub "http://${CnCNetEIP}:9090/health"
+
+  MetricsURL:
+    Description: Prometheus metrics endpoint
+    Value: !Sub "http://${CnCNetEIP}:9090/metrics"
+
+  StatusURL:
+    Description: V2 slot status endpoint
+    Value: !Sub "http://${CnCNetEIP}:${V2Port}/status"
+
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref CnCNetInstance
+
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !GetAtt CnCNetSecurityGroup.GroupId

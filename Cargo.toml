@@ -1,6 +1,6 @@
 [package]
 name = "cncnet-server"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
 authors = ["Khaled Sameer <khaled.smq@hotmail.com>"]
 description = "High-performance CnCNet tunnel server for Red Alert 2 and Yuri's Revenge"
@@ -10,30 +10,37 @@ categories = ["network-programming", "game-development"]
 license = "MIT"
 
 [profile.release]
-# ARM-optimized release profile for AWS Graviton2
 opt-level = 3
-lto = "fat"  # Better for ARM's instruction pipeline
+lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
 overflow-checks = false
 debug = false
-# Inline more aggressively on ARM
-inline-threshold = 275
 
 [profile.release-arm]
 inherits = "release"
-# Even more aggressive ARM optimizations
 lto = "fat"
 opt-level = 3
 codegen-units = 1
 
+[profile.release.build-override]
+opt-level = 3
+
 [dependencies]
-# Core async runtime - optimized for ARM
 tokio = { version = "1.40", features = [
-    "full",
-    "parking_lot", # Better performance on ARM
+    "rt-multi-thread",
+    "net",
+    "time",
+    "signal",
+    "macros",
+    "sync",
+    "parking_lot",
 ] }
+
+udp-relay-core = "0.1"
+
+# Rate limiting
 rater = "0.1.1"
 
 # Network and HTTP
@@ -41,21 +48,16 @@ hyper = { version = "1.5", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls", # Better than OpenSSL on ARM
+    "rustls-tls",
     "http2",
     "gzip",
     "brotli"
 ] }
 socket2 = { version = "0.6", features = ["all"] }
 
-# Data structures optimized for ARM
-dashmap = { version = "6.1", features = ["rayon"] }
-bytes = "1.8"
-parking_lot = "0.12"  # Faster than std::sync on ARM
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# Data structures
+dashmap = "6.1"
+parking_lot = "0.12"
 
 # Utilities
 anyhow = "1.0"
@@ -65,15 +67,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 urlencoding = "2.1"
 sha1 = "0.10"
-rand = { version = "0.9", features = ["small_rng"] }  # Faster on ARM
-chrono = "0.4"
+rand = { version = "0.9", features = ["small_rng"] }
 num_cpus = "1.16"
-futures = "0.3"
 
 # Metrics
 prometheus = "0.13"
 
-# For libc calls (ARM optimizations, sysctl, etc.)
+# For libc calls (ARM optimizations, CPU pinning)
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
@@ -81,23 +81,11 @@ libc = "0.2"
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads", "stats"] }
 
-
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.5"
 tokio-test = "0.4"
 
-[build-dependencies]
-cc = "1.1"
-
 [[bin]]
 name = "cncnet-server"
 path = "src/main.rs"
-
-# Platform-specific build settings
-[target.'cfg(target_arch = "aarch64")']
-rustflags = [
-    "-C", "target-cpu=neoverse-n1", # AWS Graviton2 CPU
-    "-C", "link-arg=-fuse-ld=lld", # Faster linker
-    "-C", "target-feature=+crc,+aes,+sha2,+fp16,+rcpc,+dotprod,+crypto"
-]

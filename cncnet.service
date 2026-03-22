@@ -9,19 +9,19 @@ User=cncnet
 Group=cncnet
 WorkingDirectory=/opt/cncnet
 
-# ARM-specific environment variables
+# Environment
 Environment="RUST_LOG=info"
 Environment="RUST_BACKTRACE=1"
 Environment="TOKIO_WORKER_THREADS=2"
 
-# Jemalloc configuration for ARM
-Environment="LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2"
+# Jemalloc tuning (statically linked via tikv-jemallocator)
 Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:10000,lg_extent_max_active_fit:3"
 
 # Memory and CPU limits for t4g.medium (4GB RAM, 2 vCPUs)
 MemoryMax=3.5G
 MemoryHigh=3G
 CPUQuota=190%
+CPUAffinity=0 1
 TasksMax=4096
 
 # IO and Network priority
@@ -46,8 +46,12 @@ RestartSec=5
 StartLimitBurst=3
 StartLimitInterval=60
 
+# ARM CPU/network tuning (run as root before dropping to cncnet user)
+ExecStartPre=-/bin/sh -c 'echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor'
+ExecStartPre=-/bin/sh -c 'echo 3 | tee /sys/class/net/*/queues/rx-*/rps_cpus'
+ExecStartPre=-/bin/sh -c 'echo 2 | tee /proc/irq/*/smp_affinity'
+
 # Main process
-ExecStartPre=/bin/bash -c 'echo "Starting CnCNet server on ARM Graviton2"'
 ExecStart=/opt/cncnet/cncnet-server \
     --port 50001 \
     --portv2 50000 \
@@ -62,9 +66,7 @@ ExecStart=/opt/cncnet/cncnet-server \
 ExecReload=/bin/kill -USR1 $MAINPID
 ExecStop=/bin/kill -TERM $MAINPID
 
-# Enable core dumps for debugging
 LimitCORE=infinity
-WorkingDirectory=/opt/cncnet
 
 [Install]
 WantedBy=multi-user.target

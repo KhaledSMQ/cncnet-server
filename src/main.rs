@@ -1,24 +1,20 @@
 mod config;
 mod errors;
+mod health;
 mod metrics;
+mod peer_to_peer;
+mod rate_limiter;
+mod shutdown;
 mod tunnel_v2;
 mod tunnel_v3;
-mod peer_to_peer;
-mod tunnel_client;
-mod rate_limiter;
-mod buffer_pool;
-mod shutdown;
-mod health;
 
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
-// ARM-specific optimized allocator
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 use tikv_jemallocator::Jemalloc;
 
@@ -78,26 +74,36 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // ARM-specific runtime configuration
     let mut builder = tokio::runtime::Builder::new_multi_thread();
 
-    // Optimize for ARM architecture
     #[cfg(target_arch = "aarch64")]
     {
-        // For t4g.medium with 2 vCPUs
         let worker_threads = if args.workers > 0 {
             args.workers
         } else {
-            // Default to number of CPUs for ARM
             num_cpus::get().min(4)
         };
 
         builder.worker_threads(worker_threads);
         builder.max_blocking_threads(worker_threads * 2);
-        builder.thread_stack_size(2 * 1024 * 1024); // 2MB stack for ARM
-
-        // Set thread names for debugging
+        builder.thread_stack_size(2 * 1024 * 1024);
         builder.thread_name("cncnet-worker");
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+            let num_cpus = num_cpus::get();
+            builder.on_thread_start(move || {
+                let tid = THREAD_ID.fetch_add(1, Ordering::Relaxed);
+                let cpu = tid % num_cpus;
+                unsafe {
+                    let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
+                    libc::CPU_SET(cpu, &mut cpuset);
+                    libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
+                }
+            });
+        }
 
         info!("Configured for ARM with {} worker threads", worker_threads);
     }
@@ -109,79 +115,46 @@ fn main() -> Result<()> {
         }
     }
 
-    let runtime = builder
-        .enable_all()
-        .build()?;
+    let runtime = builder.enable_all().build()?;
 
     runtime.block_on(async_main(args))
 }
 
 async fn async_main(args: Args) -> Result<()> {
-    // Initialize tracing with configurable format
     init_tracing(&args.log_level, &args.log_format)?;
 
-    info!("Starting CnCNet Server v2.0.0 - Production Edition");
+    info!("Starting CnCNet Server v2.0.0");
 
-    // Log ARM-specific information
     #[cfg(target_arch = "aarch64")]
     {
-        info!("Running on ARM64 architecture (optimized for AWS Graviton2)");
+        info!("Running on ARM64 architecture");
+        #[cfg(target_os = "linux")]
         if let Ok(contents) = std::fs::read_to_string("/proc/cpuinfo") {
             if contents.contains("Neoverse") {
-                info!("Detected AWS Graviton processor - optimizations enabled");
+                info!("Detected AWS Graviton processor");
             }
         }
     }
 
-    info!("Configuration loaded from CLI args and environment");
-
-    // Validate and create config
     let config = Arc::new(config::ServerConfig::from_args(args)?);
 
-    // Initialize global buffer pool with ARM optimizations
-    buffer_pool::init_global_pool();
-
-    // Initialize metrics
     let metrics = Arc::new(metrics::Metrics::new());
 
-    // Create shutdown coordinator
-    let shutdown = shutdown::ShutdownCoordinator::new();
+    let shutdown = crate::shutdown::ShutdownCoordinator::new();
 
-    // Create task semaphore - adjust for ARM's efficiency
-    #[cfg(target_arch = "aarch64")]
-    let max_concurrent_tasks = 5000; // ARM handles context switching well
-
-    #[cfg(not(target_arch = "aarch64"))]
-    let max_concurrent_tasks = 10000;
-
-    let task_limiter = Arc::new(Semaphore::new(max_concurrent_tasks));
-
-    // Start health check server
     let health_handle = health::start_health_server(
         config.metrics_port,
         metrics.clone(),
         shutdown.subscribe(),
     );
 
-    // Apply system optimizations for ARM
-    #[cfg(target_arch = "aarch64")]
-    apply_arm_optimizations();
-
-    // Start services
     let mut service_handles = Vec::new();
 
-    // P2P services
     if !config.no_p2p {
         info!("Starting P2P services on ports 8054 and 3478");
 
-        let p2p_8054 = peer_to_peer::PeerToPeer::new(
-            8054,
-            metrics.clone(),
-        );
-        let p2p_3478 = peer_to_peer::PeerToPeer::new(
-            3478,
-            metrics.clone(),
-        );
+        let p2p_8054 = peer_to_peer::PeerToPeer::new(8054, metrics.clone());
+        let p2p_3478 = peer_to_peer::PeerToPeer::new(3478, metrics.clone());
 
         let mut shutdown_rx1 = shutdown.subscribe();
         service_handles.push(tokio::spawn(async move {
@@ -217,7 +190,6 @@ async fn async_main(args: Args) -> Result<()> {
         let tunnel_v3 = Arc::new(tunnel_v3::TunnelV3::new(
             config.clone(),
             metrics.clone(),
-            task_limiter.clone(),
         ));
         info!("Starting Tunnel V3 on port {}", config.tunnel_port);
 
@@ -241,7 +213,6 @@ async fn async_main(args: Args) -> Result<()> {
         let tunnel_v2 = Arc::new(tunnel_v2::TunnelV2::new(
             config.clone(),
             metrics.clone(),
-            task_limiter.clone(),
         ));
         info!("Starting Tunnel V2 on port {}", config.tunnel_v2_port);
 
@@ -260,26 +231,24 @@ async fn async_main(args: Args) -> Result<()> {
         }));
     }
 
-    // Wait for shutdown signal
-    shutdown_handler(shutdown.clone()).await?;
+    shutdown_handler().await?;
 
     info!("Shutting down gracefully...");
 
-    // Signal all services to stop
-    shutdown.shutdown().await;
+    shutdown.shutdown();
 
-    // Wait for services with timeout
-    let timeout = tokio::time::timeout(
-        Duration::from_secs(30),
-        futures::future::join_all(service_handles),
-    ).await;
+    let timeout = tokio::time::timeout(Duration::from_secs(30), async {
+        for handle in service_handles {
+            let _ = handle.await;
+        }
+    })
+    .await;
 
     match timeout {
         Ok(_) => info!("All services stopped successfully"),
         Err(_) => warn!("Some services did not stop within timeout"),
     }
 
-    // Stop health server
     health_handle.abort();
 
     info!("Shutdown complete");
@@ -289,8 +258,8 @@ async fn async_main(args: Args) -> Result<()> {
 fn init_tracing(level: &str, format: &str) -> Result<()> {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     let fmt_layer = match format {
         "json" => fmt::layer()
@@ -313,7 +282,7 @@ fn init_tracing(level: &str, format: &str) -> Result<()> {
     Ok(())
 }
 
-async fn shutdown_handler(coordinator: shutdown::ShutdownCoordinator) -> Result<()> {
+async fn shutdown_handler() -> Result<()> {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -343,27 +312,3 @@ async fn shutdown_handler(coordinator: shutdown::ShutdownCoordinator) -> Result<
     Ok(())
 }
 
-#[cfg(target_arch = "aarch64")]
-fn apply_arm_optimizations() {
-    use std::process::Command;
-
-    // Try to set CPU governor to performance mode
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg("echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor")
-        .output();
-
-    // Enable RPS (Receive Packet Steering) for better packet distribution
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg("echo 3 | sudo tee /sys/class/net/*/queues/rx-*/rps_cpus")
-        .output();
-
-    // Set affinity for interrupts
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg("echo 2 | sudo tee /proc/irq/*/smp_affinity")
-        .output();
-
-    info!("Applied ARM-specific system optimizations");
-}

@@ -1,6 +1,6 @@
 use crate::metrics::Metrics;
 use crate::shutdown::ShutdownReceiver;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -59,7 +59,7 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     metrics: Arc<Metrics>,
 ) -> Response<Full<Bytes>> {
-    let response = match req.uri().path() {
+    match req.uri().path() {
         "/health" => Response::new(Full::new(Bytes::from("OK"))),
         "/ready" => Response::new(Full::new(Bytes::from("READY"))),
         "/metrics" => Response::new(Full::new(Bytes::from(metrics.export_prometheus()))),
@@ -67,7 +67,5 @@ async fn handle_request(
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from("Not Found")))
             .unwrap(),
-    };
-
-    response
+    }
 }
