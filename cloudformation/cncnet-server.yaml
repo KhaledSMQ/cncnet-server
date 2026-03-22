@@ -84,51 +84,12 @@ Parameters:
     MaxValue: 100
     Description: Root EBS volume size in GiB
 
-# ---------------------------------------------------------------------------
-# Mappings — latest Amazon Linux 2023 ARM64 AMIs per region
-# ---------------------------------------------------------------------------
-Mappings:
-  RegionAMI:
-    us-east-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    us-east-2:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    us-west-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    us-west-2:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    eu-west-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    eu-west-2:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    eu-west-3:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    eu-central-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    eu-north-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    ap-southeast-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    ap-southeast-2:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    ap-northeast-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    ap-northeast-2:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    ap-south-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    sa-east-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    ca-central-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    me-south-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    me-central-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    il-central-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    af-south-1:
-      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: >
+      AMI ID resolved from SSM Parameter Store (auto-selects latest
+      Amazon Linux 2023 ARM64 in the deploy region — no need to change)
 
 # ---------------------------------------------------------------------------
 # Resources
@@ -216,7 +177,7 @@ Resources:
         Timeout: PT30M
     Properties:
       InstanceType: !Ref InstanceType
-      ImageId: !FindInMap [RegionAMI, !Ref "AWS::Region", AMI]
+      ImageId: !Ref LatestAmiId
       KeyName: !Ref KeyName
       IamInstanceProfile: !Ref InstanceProfile
       SecurityGroupIds:
@@ -227,7 +188,6 @@ Resources:
             VolumeSize: !Ref VolumeSize
             VolumeType: gp3
             Iops: 3000
-            Throughput: 125
             Encrypted: true
       Tags:
         - Key: Name
